@@ -5,14 +5,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/devsy-org/devsy/pkg/agent/tunnel"
 	pkgconfig "github.com/devsy-org/devsy/pkg/config"
 	"github.com/devsy-org/devsy/pkg/devcontainer/config"
 	"github.com/devsy-org/devsy/pkg/log"
+	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
+)
+
+const (
+	workspaceEnvAlphaAssignment = "ALPHA=first"
+	workspaceEnvTokenAssignment = "TOKEN=one=two"
+	workspaceEnvZedAssignment   = "ZED=last"
 )
 
 // TestSecretMountPath_RejectsEscapes ensures only a plain filename is accepted:
@@ -150,6 +158,53 @@ func TestWriteResultFileTo_SkipsWriteWhenContentUnchanged(t *testing.T) {
 			first.ModTime(), second.ModTime(),
 		)
 	}
+}
+
+type WorkspaceEnvironmentTestSuite struct {
+	suite.Suite
+}
+
+func TestWorkspaceEnvironmentTestSuite(t *testing.T) {
+	suite.Run(t, new(WorkspaceEnvironmentTestSuite))
+}
+
+func (s *WorkspaceEnvironmentTestSuite) TestParseRejectsDuplicateTarget() {
+	_, _, err := parseWorkspaceEnvironment([]string{"MODE=one", "MODE=two"})
+	s.Require().ErrorContains(err, `"MODE"`)
+}
+
+func (s *WorkspaceEnvironmentTestSuite) TestParseCanonicalizesWithoutChangingInput() {
+	assignments := []string{
+		workspaceEnvZedAssignment,
+		workspaceEnvAlphaAssignment,
+		workspaceEnvTokenAssignment,
+	}
+	original := slices.Clone(assignments)
+
+	got, canonical, err := parseWorkspaceEnvironment(assignments)
+	s.Require().NoError(err)
+	s.Assert().Equal(original, assignments)
+	wantCanonical := []string{
+		workspaceEnvAlphaAssignment,
+		workspaceEnvTokenAssignment,
+		workspaceEnvZedAssignment,
+	}
+	s.Assert().Equal(wantCanonical, canonical)
+	s.Assert().Equal("one=two", got["TOKEN"])
+	_, reorderedCanonical, err := parseWorkspaceEnvironment([]string{
+		workspaceEnvTokenAssignment,
+		workspaceEnvAlphaAssignment,
+		workspaceEnvZedAssignment,
+	})
+	s.Require().NoError(err)
+	s.Assert().Equal(canonical, reorderedCanonical)
+}
+
+func (s *WorkspaceEnvironmentTestSuite) TestPatchRejectsDuplicatesWithoutMutatingInput() {
+	assignments := []string{"MODE=one", "MODE=two"}
+	original := slices.Clone(assignments)
+	s.Require().Error(patchEtcEnvironmentFlags(assignments))
+	s.Assert().Equal(original, assignments)
 }
 
 func TestWriteResultFileTo_WidensExistingRestrictiveMode(t *testing.T) {
