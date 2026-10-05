@@ -3,8 +3,10 @@ package devcontainer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -27,6 +29,7 @@ import (
 	provider2 "github.com/devsy-org/devsy/pkg/provider"
 	"github.com/devsy-org/devsy/pkg/status"
 	"github.com/devsy-org/devsy/pkg/types"
+	"github.com/devsy-org/devsy/pkg/version"
 )
 
 const (
@@ -118,14 +121,29 @@ func (r *runner) injectAgentIntoContainer(ctx context.Context, timeout time.Dura
 	strategy := r.newAgentDelivery()
 
 	if strategy.Phase() == delivery.PhasePostStart {
-		if err := r.deliverPostStart(ctx, strategy); err != nil {
-			log.Warnf("platform-native delivery failed, falling back to legacy inject: %v", err)
-			return r.legacyInject(ctx, timeout)
-		}
-		return nil
+		return fallbackAgentDelivery(
+			func() error { return r.deliverPostStart(ctx, strategy) },
+			func() error { return r.legacyInject(ctx, timeout) },
+		)
 	}
 
 	return r.legacyInject(ctx, timeout)
+}
+
+func fallbackAgentDelivery(native, legacy func() error) error {
+	nativeErr := native()
+	if nativeErr == nil {
+		return nil
+	}
+	log.Warnf("platform-native delivery failed, falling back to legacy inject: %v", nativeErr)
+	legacyErr := legacy()
+	if legacyErr == nil {
+		return nil
+	}
+	return errors.Join(
+		fmt.Errorf("platform-native agent delivery failed: %w", nativeErr),
+		fmt.Errorf("legacy agent injection failed: %w", legacyErr),
+	)
 }
 
 func (r *runner) newAgentDelivery() delivery.AgentDelivery {
@@ -197,6 +215,10 @@ func (r *runner) deliverPostStart(ctx context.Context, strategy delivery.AgentDe
 		opts.BinarySource = mgr.AcquireBinary
 		opts.Arch = arch
 		opts.PreferInContainerDownload = !mgr.HasLocalOverride(arch)
+		opts.SkipVersionCheck = strings.TrimSpace(os.Getenv(pkgconfig.EnvAgentBinary)) != "" ||
+			os.Getenv(pkgconfig.EnvAgentURL) != "" ||
+			opts.DownloadURL != pkgconfig.DefaultAgentDownloadURL() ||
+			version.GetVersion() == version.DevVersion
 	}
 	if err := strategy.DeliverPostStart(ctx, opts); err != nil {
 		return fmt.Errorf("deliver agent (post-start): %w", err)

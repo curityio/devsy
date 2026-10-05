@@ -3,6 +3,7 @@ package devcontainer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"reflect"
@@ -17,6 +18,7 @@ import (
 	"github.com/devsy-org/devsy/pkg/driver"
 	provider2 "github.com/devsy-org/devsy/pkg/provider"
 	"github.com/devsy-org/devsy/pkg/types"
+	"github.com/devsy-org/devsy/pkg/version"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -475,4 +477,67 @@ func TestPostStartDeliveryRetainsArchitectureForBinarySource(t *testing.T) {
 	d.err = context.Canceled
 	assert.ErrorIs(t, r.deliverPostStart(context.Background(), strategy), d.err)
 	assert.False(t, strategy.called)
+}
+
+func TestPostStartDeliveryCustomAgentVersionPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		binaryPath  string
+		envURL      string
+		downloadURL string
+		wantSkip    bool
+	}{
+		{name: "release agent"},
+		{name: "empty local override", binaryPath: "  "},
+		{name: "local override", binaryPath: "/custom/devsy", wantSkip: true},
+		{name: "custom download", downloadURL: "http://localhost:8080/", wantSkip: true},
+		{name: "environment download override", envURL: "http://localhost:8080", wantSkip: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(pkgconfig.EnvAgentBinary, tc.binaryPath)
+			t.Setenv(pkgconfig.EnvAgentURL, tc.envURL)
+			r := newTestRunner(&architectureDriver{arch: "arm64"})
+			r.agentDownloadURL = tc.downloadURL
+			strategy := &capturePostStartDelivery{usesBinarySource: true}
+			require.NoError(t, r.deliverPostStart(context.Background(), strategy))
+			wantSkip := tc.wantSkip || version.GetVersion() == version.DevVersion
+			assert.Equal(t, wantSkip, strategy.opts.SkipVersionCheck)
+		})
+	}
+}
+
+func TestFallbackAgentDeliveryPreservesBothErrors(t *testing.T) {
+	nativeErr := errors.New("exec-stream delivery stalled")
+	legacyErr := errors.New("read ping: EOF")
+
+	err := fallbackAgentDelivery(
+		func() error { return nativeErr },
+		func() error { return legacyErr },
+	)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, nativeErr)
+	assert.ErrorIs(t, err, legacyErr)
+	assert.Contains(t, err.Error(), "platform-native agent delivery failed")
+	assert.Contains(t, err.Error(), "legacy agent injection failed")
+}
+
+func TestFallbackAgentDeliverySuccessfulPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		nativeErr  error
+		wantLegacy bool
+	}{
+		{name: "native success"},
+		{name: "legacy recovery", nativeErr: errors.New("native failed"), wantLegacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyCalled := false
+			err := fallbackAgentDelivery(
+				func() error { return tc.nativeErr },
+				func() error { legacyCalled = true; return nil },
+			)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantLegacy, legacyCalled)
+		})
+	}
 }
