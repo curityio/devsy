@@ -460,7 +460,7 @@ describe("secret unlock IPC lifecycle", () => {
     args.remember = false
     args.requestId = "changed-request"
     approve({ response: 1, checkboxChecked: false })
-    await expect(submission).resolves.toEqual({ ok: true })
+    await expect(submission).resolves.toEqual({ ok: true, remembered: true })
     expect(cli.runRaw).toHaveBeenCalledExactlyOnceWith(
       ["secret", "protection", "remember"],
       {
@@ -471,6 +471,364 @@ describe("secret unlock IPC lifecycle", () => {
     await expect(pending).resolves.toBe("original-private")
     expect(cli.setSessionPassphrase).not.toHaveBeenCalled()
   })
+
+  it.each(["dialog", "cli"] as const)(
+    "rejects duplicate credential submissions during the %s await while allowing cancellation",
+    async (stage) => {
+      const { cli, event, unlock, requestId } = setup()
+      const pending = unlock()
+      let finishDialog!: (value: {
+        response: number
+        checkboxChecked: boolean
+      }) => void
+      let finishCli!: (value: string) => void
+      if (stage === "dialog")
+        vi.mocked(dialog.showMessageBox).mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              finishDialog = resolve
+            }),
+        )
+      else
+        cli.runRaw.mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              finishCli = resolve
+            }),
+        )
+
+      const args = {
+        requestId: requestId(),
+        passphrase: "private",
+        remember: true,
+      }
+      const submission = handlers.get("secret_unlock_submit")?.(event, args)
+      if (stage === "cli")
+        await vi.waitFor(() => expect(cli.runRaw).toHaveBeenCalledOnce())
+
+      for (const remember of [true, false])
+        await expect(
+          handlers.get("secret_unlock_submit")?.(event, {
+            ...args,
+            remember,
+            passphrase: "duplicate-private",
+          }),
+        ).resolves.toEqual({
+          ok: false,
+          message: "An unlock submission is already in progress.",
+        })
+
+      // A credential-free submission remains an available cancellation path.
+      await handlers.get("secret_unlock_submit")?.(event, {
+        requestId: args.requestId,
+      })
+      await expect(pending).resolves.toBeUndefined()
+      if (stage === "dialog")
+        finishDialog({ response: 1, checkboxChecked: false })
+      else finishCli("")
+      await expect(submission).resolves.toEqual(
+        stage === "cli"
+          ? {
+              ok: false,
+              remembered: true,
+              message:
+                "The passphrase was saved in the OS keychain, but unlocking was canceled. Use Forget to remove the remembered credential.",
+            }
+          : {
+              ok: false,
+              message: "Unlock request is no longer active.",
+            },
+      )
+    },
+  )
+
+  it("reports a saved credential when navigation cancels after the remember CLI succeeds", async () => {
+    const { cli, event, unlock, webContents, requestId } = setup()
+    const pending = unlock()
+    cli.runRaw.mockImplementation(async () => {
+      webContents.emit("did-start-navigation", {}, "app://reload", false, true)
+      return ""
+    })
+    await expect(
+      handlers.get("secret_unlock_submit")?.(event, {
+        requestId: requestId(),
+        passphrase: "private",
+        remember: true,
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      remembered: true,
+      message:
+        "The passphrase was saved in the OS keychain, but unlocking was canceled. Use Forget to remove the remembered credential.",
+    })
+    await expect(pending).resolves.toBeUndefined()
+  })
+
+  it("does not report a saved credential after a remember CLI failure and releases the submission claim", async () => {
+    const { cli, event, unlock, requestId } = setup()
+    const pending = unlock()
+    cli.runRaw
+      .mockRejectedValueOnce(new Error("keychain unavailable"))
+      .mockResolvedValueOnce("")
+    const firstId = requestId()
+    await expect(
+      handlers.get("secret_unlock_submit")?.(event, {
+        requestId: firstId,
+        passphrase: "private",
+        remember: true,
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      message: "The passphrase could not be verified and remembered.",
+    })
+    expect(cli.setSessionPassphrase).not.toHaveBeenCalled()
+    await expect(
+      handlers.get("secret_unlock_submit")?.(event, {
+        requestId: firstId,
+        passphrase: "private",
+        remember: true,
+      }),
+    ).resolves.toEqual({ ok: true, remembered: true })
+    await expect(pending).resolves.toBe("private")
+  })
+
+  it("allows a new request to proceed while an older remember CLI call is pending", async () => {
+    const { cli, event, unlock, webContents, requestId } = setup()
+    const first = unlock()
+    const oldId = requestId()
+    let finishFirstCli!: (value: string) => void
+    cli.runRaw
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishFirstCli = resolve
+          }),
+      )
+      .mockResolvedValueOnce("")
+    const firstSubmission = handlers.get("secret_unlock_submit")?.(event, {
+      requestId: oldId,
+      passphrase: "older-private",
+      remember: true,
+    })
+    await vi.waitFor(() => expect(cli.runRaw).toHaveBeenCalledOnce())
+    webContents.emit("did-start-navigation", {}, "app://reload", false, true)
+    await expect(first).resolves.toBeUndefined()
+
+    const second = unlock()
+    const newId = requestId()
+    expect(newId).not.toBe(oldId)
+    await expect(
+      handlers.get("secret_unlock_submit")?.(event, {
+        requestId: newId,
+        passphrase: "newer-private",
+        remember: true,
+      }),
+    ).resolves.toEqual({ ok: true, remembered: true })
+    await expect(second).resolves.toBe("newer-private")
+
+    finishFirstCli("")
+    await expect(firstSubmission).resolves.toMatchObject({
+      ok: false,
+      remembered: true,
+    })
+  })
+
+  it("keeps a late saved-credential notice through navigation until a trusted replacement renderer acknowledges it", async () => {
+    const { cli, event, unlock, webContents, requestId } = setup()
+    const pending = unlock()
+    const id = requestId()
+    cli.runRaw.mockImplementation(async () => {
+      webContents.emit("did-start-navigation", {}, "app://reload", false, true)
+      return ""
+    })
+    const result = await handlers.get("secret_unlock_submit")?.(event, {
+      requestId: id,
+      passphrase: "secret-value",
+      remember: true,
+    })
+    expect(result).toMatchObject({ ok: false, remembered: true })
+    await expect(pending).resolves.toBeUndefined()
+
+    const replacementFrame = {
+      url: pathToFileURL(join(__dirname, "../../renderer/index.html")).href,
+      isDestroyed: () => false,
+    }
+    webContents.mainFrame = replacementFrame
+    const replacementEvent = {
+      sender: webContents,
+      senderFrame: replacementFrame,
+    }
+    const notices = handlers.get("secret_unlock_notices")
+    const noticeResult = {
+      ok: true,
+      notices: [{ requestId: id, message: expect.any(String) }],
+    }
+    expect(await notices?.(replacementEvent)).toEqual(noticeResult)
+    expect(await notices?.(replacementEvent)).toEqual(noticeResult)
+    expect(webContents.send).toHaveBeenCalledWith("secret_unlock_notice")
+    expect(JSON.stringify(await notices?.(replacementEvent))).not.toContain(
+      "secret-value",
+    )
+    expect(
+      await handlers.get("secret_unlock_notice_ack")?.(replacementEvent, {
+        requestId: id,
+      }),
+    ).toEqual({ ok: true })
+    expect(await notices?.(replacementEvent)).toEqual({
+      ok: true,
+      notices: [],
+    })
+  })
+
+  it("rejects untrusted notice reads and acknowledgements without consuming the notice", async () => {
+    const { cli, event, unlock, webContents, requestId } = setup()
+    const pending = unlock()
+    const id = requestId()
+    cli.runRaw.mockImplementation(async () => {
+      webContents.emit("did-start-navigation", {}, "app://reload", false, true)
+      return ""
+    })
+    await handlers.get("secret_unlock_submit")?.(event, {
+      requestId: id,
+      passphrase: "private",
+      remember: true,
+    })
+    await expect(pending).resolves.toBeUndefined()
+    webContents.mainFrame.url = "https://untrusted.example/"
+    const untrusted = {
+      sender: webContents,
+      senderFrame: webContents.mainFrame,
+    }
+    const denied = {
+      ok: false,
+      message: "Secret operations require the main application window.",
+    }
+    expect(await handlers.get("secret_unlock_notices")?.(untrusted)).toEqual(
+      denied,
+    )
+    expect(
+      await handlers.get("secret_unlock_notice_ack")?.(untrusted, {
+        requestId: id,
+      }),
+    ).toEqual(denied)
+    const trustedFrame = {
+      url: pathToFileURL(join(__dirname, "../../renderer/index.html")).href,
+      isDestroyed: () => false,
+    }
+    webContents.mainFrame = trustedFrame
+    const trusted = { sender: webContents, senderFrame: trustedFrame }
+    expect(
+      await handlers.get("secret_unlock_notices")?.(trusted),
+    ).toMatchObject({
+      ok: true,
+      notices: [{ requestId: id }],
+    })
+  })
+
+  it("rejects invalid notice acknowledgements and treats unknown IDs as successful", async () => {
+    const { event } = setup()
+    const ack = handlers.get("secret_unlock_notice_ack")
+    expect(await ack?.(event, {})).toEqual({
+      ok: false,
+      message: "A valid unlock request ID is required.",
+    })
+    expect(await ack?.(event, { requestId: "unknown" })).toEqual({
+      ok: true,
+    })
+  })
+
+  it("does not queue notices for declined or failed saves or for a normal unlock", async () => {
+    const { cli, event, unlock, requestId } = setup()
+    const notices = handlers.get("secret_unlock_notices")
+    const declinedPending = unlock()
+    vi.mocked(dialog.showMessageBox).mockResolvedValue({
+      response: 0,
+      checkboxChecked: false,
+    })
+    await handlers.get("secret_unlock_submit")?.(event, {
+      requestId: requestId(),
+      passphrase: "private",
+      remember: true,
+    })
+    await handlers.get("secret_unlock_submit")?.(event, {
+      requestId: requestId(),
+    })
+    await expect(declinedPending).resolves.toBeUndefined()
+    expect(await notices?.(event)).toEqual({ ok: true, notices: [] })
+
+    vi.mocked(dialog.showMessageBox).mockResolvedValue({
+      response: 1,
+      checkboxChecked: false,
+    })
+    const failedPending = unlock()
+    cli.runRaw.mockRejectedValueOnce(new Error("keychain unavailable"))
+    await handlers.get("secret_unlock_submit")?.(event, {
+      requestId: requestId(),
+      passphrase: "private",
+      remember: true,
+    })
+    await handlers.get("secret_unlock_submit")?.(event, {
+      requestId: requestId(),
+    })
+    await expect(failedPending).resolves.toBeUndefined()
+    expect(await notices?.(event)).toEqual({ ok: true, notices: [] })
+
+    const normalPending = unlock()
+    await handlers.get("secret_unlock_submit")?.(event, {
+      requestId: requestId(),
+      passphrase: "private",
+      remember: true,
+    })
+    await expect(normalPending).resolves.toBe("private")
+    expect(await notices?.(event)).toEqual({ ok: true, notices: [] })
+  })
+
+  it.each(["throw", "destroy"] as const)(
+    "keeps the notice queued if the wakeup send %s",
+    async (failure) => {
+      const { cli, event, unlock, webContents, requestId } = setup()
+      const pending = unlock()
+      const id = requestId()
+      cli.runRaw.mockImplementation(async () => {
+        webContents.emit(
+          "did-start-navigation",
+          {},
+          "app://reload",
+          false,
+          true,
+        )
+        if (failure === "destroy") webContents.isDestroyed = () => true
+        return ""
+      })
+      if (failure === "throw") {
+        // Fail the next send (the canceled unlock wakeup) after the initial prompt.
+        webContents.send.mockImplementation((channel: string) => {
+          if (channel === "secret_unlock_notice") throw new Error("closed")
+        })
+      }
+      const result = await handlers.get("secret_unlock_submit")?.(event, {
+        requestId: id,
+        passphrase: "private",
+        remember: true,
+      })
+      await expect(pending).resolves.toBeUndefined()
+      expect(result).toMatchObject({ ok: false, remembered: true })
+
+      webContents.isDestroyed = () => false
+      const frame = {
+        url: pathToFileURL(join(__dirname, "../../renderer/index.html")).href,
+        isDestroyed: () => false,
+      }
+      webContents.mainFrame = frame
+      const replacement = { sender: webContents, senderFrame: frame }
+      expect(
+        await handlers.get("secret_unlock_notices")?.(replacement),
+      ).toMatchObject({
+        ok: true,
+        notices: [{ requestId: id }],
+      })
+    },
+  )
 
   it.each(["dialog", "cli"] as const)(
     "cannot settle a replacement request after navigation during %s",
@@ -521,10 +879,19 @@ describe("secret unlock IPC lifecycle", () => {
       if (stage === "dialog")
         finishDialog({ response: 1, checkboxChecked: false })
       else finishCli("")
-      await expect(submission).resolves.toEqual({
-        ok: false,
-        message: "Unlock request is no longer active.",
-      })
+      await expect(submission).resolves.toEqual(
+        stage === "cli"
+          ? {
+              ok: false,
+              remembered: true,
+              message:
+                "The passphrase was saved in the OS keychain, but unlocking was canceled. Use Forget to remove the remembered credential.",
+            }
+          : {
+              ok: false,
+              message: "Unlock request is no longer active.",
+            },
+      )
       expect(newSettled).toBe(false)
       expect(cli.runRaw).toHaveBeenCalledTimes(stage === "dialog" ? 0 : 1)
       expect(cli.setSessionPassphrase).not.toHaveBeenCalled()
@@ -558,10 +925,19 @@ describe("secret unlock IPC lifecycle", () => {
           passphrase: "private",
           remember: true,
         }),
-      ).toEqual({
-        ok: false,
-        message: "Secret operations require the main application window.",
-      })
+      ).toEqual(
+        stage === "cli"
+          ? {
+              ok: false,
+              remembered: true,
+              message:
+                "The passphrase was saved in the OS keychain, but unlocking was canceled. Use Forget to remove the remembered credential.",
+            }
+          : {
+              ok: false,
+              message: "Secret operations require the main application window.",
+            },
+      )
       expect(cli.runRaw).toHaveBeenCalledTimes(stage === "dialog" ? 0 : 1)
       expect(cli.setSessionPassphrase).not.toHaveBeenCalled()
       webContents.emit("render-process-gone")
