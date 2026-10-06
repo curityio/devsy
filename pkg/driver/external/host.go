@@ -22,7 +22,7 @@ import (
 const startupTimeout = 15 * time.Second
 
 // Host opens an owned plugin session per operation. It is not yet registered
-// as a workspace driver; Exec and Logs are added in the next integration stage.
+// as a workspace driver; factory integration is a separate stage.
 type Host struct {
 	config           provider.ProviderAgentConfig
 	binariesDir      string
@@ -30,6 +30,7 @@ type Host struct {
 	supervisorArgs   []string
 	environment      []string
 	redactor         *secrets.Redactor
+	redactions       *workspaceRedactions
 	info             *runtimev1.InfoResponse
 	timeout          time.Duration
 }
@@ -83,6 +84,7 @@ func newHost(ctx context.Context, options hostOptions) (*Host, error) {
 		environment:      slices.Clone(options.environment),
 		timeout:          options.timeout,
 		redactor:         secrets.NewEnvironmentRedactor(options.environment),
+		redactions:       &workspaceRedactions{workspaces: make(map[string]*workspaceRedaction)},
 	}
 	// Freeze provider declarations so later caller mutation cannot change identity.
 	h.config.External.Args = slices.Clone(options.config.External.Args)

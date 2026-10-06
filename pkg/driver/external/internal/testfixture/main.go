@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/devsy-org/devsy-runtime-sdk/conformance/fake"
@@ -47,7 +48,7 @@ func serve(mode, state string, delay time.Duration) {
 	}
 	fixtureMode := mode
 	if fixtureMode == "blocked" || fixtureMode == "environment" || fixtureMode == "block-info" ||
-		fixtureMode == "env-error" {
+		fixtureMode == "env-error" || strings.HasPrefix(fixtureMode, "stream-") {
 		fixtureMode = fake.Normal
 	}
 	runtime, err := fake.New(fake.Config{StateDir: state, Mode: fixtureMode})
@@ -89,7 +90,7 @@ func (f *fixture) Preflight(
 	ctx context.Context,
 	request *runtimev1.PreflightRequest,
 ) (*runtimev1.PreflightResponse, error) {
-	if f.mode != "blocked" {
+	if f.mode != "blocked" && f.mode != "stream-block-child" {
 		return f.Driver.Preflight(ctx, request)
 	}
 	executable, err := os.Executable()
@@ -121,6 +122,11 @@ func (f *fixture) RunImage(
 	ctx context.Context,
 	request *runtimev1.RunImageRequest,
 ) (*runtimev1.RunImageResponse, error) {
+	if f.mode == "stream-workspace-secret" {
+		if err := f.saveEnvironment(request); err != nil {
+			return nil, err
+		}
+	}
 	if f.mode != "env-error" {
 		return f.Driver.RunImage(ctx, request)
 	}
