@@ -138,52 +138,10 @@ func (r *runner) resolveContainer(
 	params *resolveParams,
 	containerDetails *config.ContainerDetails,
 ) (*resolvedContainer, error) {
-	options := params.options
-	if containerDetails != nil && !options.Recreate &&
-		r.needsTerminalSecretEnvironmentMigration(containerDetails) {
-		if err := r.validateTerminalSecretEnvironmentSupport(); err != nil {
-			return nil, err
-		}
-		if params.parsedConfig.Config.ContainerID != "" {
-			return nil, fmt.Errorf(
-				"cannot inject attached terminal secrets into externally managed container: "+
-					"the container does not have the required %s tmpfs mount",
-				config.SecretsEnvDir,
-			)
-		}
-		log.Info(
-			"recreating workspace because attached terminal secrets require the secure runtime mount",
-		)
-		options.Recreate = true
-		params.options.Recreate = true
-	}
-	if containerDetails != nil && !options.Recreate &&
-		needsSecretFileMountMigration(containerDetails, options.SecretsMount) {
-		if !driver.DriverSupportsMountType(r.driver, driver.MountTypeTmpfs) {
-			return nil, fmt.Errorf(
-				"the current provider does not support securely mounting workspace file secrets",
-			)
-		}
-		if params.parsedConfig.Config.ContainerID != "" {
-			return nil, fmt.Errorf(
-				"cannot inject file secrets into externally managed container: "+
-					"the container does not have the required %s tmpfs mount",
-				config.SecretsMountDir,
-			)
-		}
-		log.Info("recreating workspace because file secrets require the secure runtime mount")
-		options.Recreate = true
-		params.options.Recreate = true
-	}
-
-	if options.Recreate && params.parsedConfig.Config.ContainerID != "" {
-		return nil, fmt.Errorf("cannot recreate container not created by Devsy")
-	}
-	if err := r.provisioningPreflightForRecreate(ctx, options); err != nil {
+	if err := r.prepareContainerRecreation(ctx, containerDetails, params); err != nil {
 		return nil, err
 	}
-
-	if options.Recreate || containerDetails == nil {
+	if params.options.Recreate || containerDetails == nil {
 		return r.resolveNewContainer(ctx, params)
 	}
 
@@ -197,6 +155,73 @@ func (r *runner) resolveContainer(
 		substitutionContext.ContainerWorkspaceFolder = actual
 	}
 	return r.resolveExistingContainer(ctx, containerDetails, params)
+}
+
+func (r *runner) prepareContainerRecreation(
+	ctx context.Context,
+	details *config.ContainerDetails,
+	params *resolveParams,
+) error {
+	if err := r.applyDriverRecreateRequirement(ctx, details, params); err != nil {
+		return err
+	}
+	if err := r.applyTerminalSecretRecreateRequirement(details, params); err != nil {
+		return err
+	}
+	if err := r.applyFileSecretRecreateRequirement(details, params); err != nil {
+		return err
+	}
+	if params.options.Recreate && params.parsedConfig.Config.ContainerID != "" {
+		return fmt.Errorf("cannot recreate container not created by Devsy")
+	}
+	return r.provisioningPreflightForRecreate(ctx, params.options)
+}
+
+func (r *runner) applyTerminalSecretRecreateRequirement(
+	details *config.ContainerDetails,
+	params *resolveParams,
+) error {
+	if details == nil || params.options.Recreate ||
+		!r.needsTerminalSecretEnvironmentMigration(details) {
+		return nil
+	}
+	if err := r.validateTerminalSecretEnvironmentSupport(); err != nil {
+		return err
+	}
+	if params.parsedConfig.Config.ContainerID != "" {
+		return fmt.Errorf(
+			"cannot inject attached terminal secrets into externally managed container: "+
+				"the container does not have the required %s tmpfs mount",
+			config.SecretsEnvDir,
+		)
+	}
+	return r.scheduleContainerRecreation(
+		params,
+		"attached terminal secrets require the secure runtime mount",
+	)
+}
+
+func (r *runner) applyFileSecretRecreateRequirement(
+	details *config.ContainerDetails,
+	params *resolveParams,
+) error {
+	if details == nil || params.options.Recreate ||
+		!needsSecretFileMountMigration(details, params.options.SecretsMount) {
+		return nil
+	}
+	if !driver.DriverSupportsMountType(r.driver, driver.MountTypeTmpfs) {
+		return fmt.Errorf(
+			"the current provider does not support securely mounting workspace file secrets",
+		)
+	}
+	if params.parsedConfig.Config.ContainerID != "" {
+		return fmt.Errorf(
+			"cannot inject file secrets into externally managed container: "+
+				"the container does not have the required %s tmpfs mount",
+			config.SecretsMountDir,
+		)
+	}
+	return r.scheduleContainerRecreation(params, "file secrets require the secure runtime mount")
 }
 
 func (r *runner) provisioningPreflightForRecreate(ctx context.Context, options UpOptions) error {
@@ -288,6 +313,9 @@ func (r *runner) mergeExistingContainerConfig(
 	containerDetails *config.ContainerDetails,
 	p *resolveParams,
 ) (*config.MergedDevContainerConfig, error) {
+	if _, ok := r.driver.(driver.RecreateRequiredDriver); ok {
+		return r.currentContainerIdentity(ctx, containerDetails, p)
+	}
 	imageMetadataConfig, err := metadata.GetImageMetadataFromContainer(
 		containerDetails,
 		p.substitutionContext,
@@ -296,6 +324,14 @@ func (r *runner) mergeExistingContainerConfig(
 		return nil, err
 	}
 
+	return r.mergeContainerMetadata(ctx, imageMetadataConfig, p)
+}
+
+func (r *runner) mergeContainerMetadata(
+	ctx context.Context,
+	imageMetadataConfig *config.ImageMetadataConfig,
+	p *resolveParams,
+) (*config.MergedDevContainerConfig, error) {
 	if p.options.ExtraDevContainerPath != "" {
 		if imageMetadataConfig == nil {
 			imageMetadataConfig = &config.ImageMetadataConfig{}
@@ -425,9 +461,8 @@ func (r *runner) lingerWarning(ctx context.Context) string {
 	return helper.LingerWarning(ctx)
 }
 
-// buildNewContainerConfig builds the image (deleting the existing container
-// first when recreating) and produces the merged devcontainer config from the
-// build's image metadata.
+// buildNewContainerConfig builds the image and merges its metadata. Drivers
+// with runner-managed recreation are torn down after the build succeeds.
 func (r *runner) buildNewContainerConfig(
 	ctx context.Context,
 	p *resolveParams,
@@ -561,6 +596,8 @@ func (r *runner) deleteForRecreate(ctx context.Context) error {
 		}
 		return nil
 
+	case driver.RecreateOnRun:
+		return nil
 	case driver.RecreateStop:
 		if err := r.driver.StopDevContainer(ctx, r.id); err != nil {
 			return fmt.Errorf("stop devcontainer: %w", err)
@@ -733,7 +770,11 @@ func (r *runner) runContainer(
 		}
 	}
 
+	runOptions.AllowRecreate = p.options.Recreate
 	runOptions.Env = r.addExtraEnvVars(runOptions.Env)
+	if _, ok := r.driver.(driver.RecreateRequiredDriver); ok {
+		runOptions.Labels = append(runOptions.Labels, metadata.CreationConfigLabel+"="+stringTrue)
+	}
 
 	// Image drivers (Docker, Apple) build and run a local OCI image.
 	if imageDriver, ok := r.driver.(driver.ImageRunner); ok {
@@ -856,6 +897,8 @@ func (r *runner) getDockerlessRunOptions(
 		UID:        r.workspaceUID(),
 		Image:      image,
 		User:       containerRootUser,
+		RemoteUser: effectiveRemoteUser(mergedConfig, buildInfo.Dockerless.User),
+		Dockerless: true,
 		Entrypoint: "/.dockerless/dockerless",
 		Cmd: []string{
 			"start",
@@ -932,6 +975,7 @@ func (r *runner) getRunOptions(
 		Image:          buildInfo.ImageName,
 		ImageBuilt:     buildInfo.BuiltLocally,
 		User:           user,
+		RemoteUser:     effectiveRemoteUser(mergedConfig, user),
 		Entrypoint:     entrypoint,
 		Cmd:            cmd,
 		Env:            mergedConfig.ContainerEnv,
@@ -1096,4 +1140,80 @@ func GetContainerEntrypointAndArgs(
 		cmd = append(cmd, imageDetails.Config.Cmd...)
 	}
 	return shShellPath, cmd
+}
+
+func effectiveRemoteUser(merged *config.MergedDevContainerConfig, containerUser string) string {
+	if merged.RemoteUser != "" {
+		return merged.RemoteUser
+	}
+	if containerUser != "" {
+		return containerUser
+	}
+	return containerRootUser
+}
+
+func (r *runner) applyDriverRecreateRequirement(
+	ctx context.Context,
+	details *config.ContainerDetails,
+	p *resolveParams,
+) error {
+	if details == nil || p.options.Recreate {
+		return nil
+	}
+	if _, ok := r.driver.(driver.RecreateRequiredDriver); !ok {
+		return nil
+	}
+	merged, err := r.currentContainerIdentity(ctx, details, p)
+	if err != nil {
+		return err
+	}
+	containerUser := merged.ContainerUser
+	if containerUser == "" {
+		containerUser = details.Config.Labels[config.UserLabel]
+	}
+	required, reason := driver.DriverRequiresRecreate(
+		r.driver,
+		details,
+		effectiveRemoteUser(merged, containerUser),
+	)
+	if !required {
+		return nil
+	}
+	if p.parsedConfig.Config.ContainerID != "" {
+		return fmt.Errorf("cannot migrate externally managed container: %s", reason)
+	}
+	return r.scheduleContainerRecreation(p, reason)
+}
+
+func (r *runner) currentContainerIdentity(
+	ctx context.Context,
+	details *config.ContainerDetails,
+	p *resolveParams,
+) (*config.MergedDevContainerConfig, error) {
+	imageMetadata, err := metadata.GetImageMetadataFromContainer(details, p.substitutionContext)
+	if err != nil {
+		return nil, err
+	}
+	if details.Config.Labels[metadata.CreationConfigLabel] == stringTrue &&
+		len(imageMetadata.Config) > 0 {
+		imageMetadata.Config = imageMetadata.Config[:len(imageMetadata.Config)-1]
+	}
+	imageMetadata.Config = append(
+		imageMetadata.Config,
+		metadata.DevContainerConfigToImageMetadata(p.parsedConfig.Config),
+	)
+	return r.mergeContainerMetadata(ctx, imageMetadata, p)
+}
+
+func (r *runner) scheduleContainerRecreation(params *resolveParams, reason string) error {
+	if driver.DriverRecreateMode(r.driver) == driver.RecreateOnRun {
+		return fmt.Errorf(
+			"workspace requires recreation because %s; back up VM-local data and rerun with --recreate: "+
+				"replacement discards the VM root disk and cannot roll back after removal",
+			reason,
+		)
+	}
+	log.Infof("recreating workspace because %s", reason)
+	params.options.Recreate = true
+	return nil
 }

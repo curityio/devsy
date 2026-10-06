@@ -9,18 +9,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/devsy-org/devsy/pkg/devcontainer/config"
+	"github.com/devsy-org/devsy/pkg/driver"
 	"github.com/devsy-org/devsy/pkg/flags/names"
-	"github.com/devsy-org/devsy/pkg/image"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 )
 
-type cliClient struct{}
+type cliClient struct{ dockerPath string }
 
 var _ sandboxClient = cliClient{}
 
@@ -50,25 +51,36 @@ func (cliClient) Version(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func (cliClient) EnsureImage(ctx context.Context, imageRef string) error {
-	if dockerImageExists(ctx, imageRef) {
-		return loadFromDocker(ctx, imageRef)
+func (c cliClient) PrepareImage(
+	ctx context.Context,
+	ref string,
+	builtLocally bool,
+) (*preparedImage, error) {
+	img, cleanup, err := filesystemUserResolver(c).openImage(ctx, ref, builtLocally)
+	if err != nil {
+		return nil, err
 	}
-	// #nosec G204 -- args are a resolved binary path and a validated image ref
-	out, err := exec.CommandContext(ctx, msbBinary(), "pull", imageRef).CombinedOutput()
-	if err == nil {
-		return nil
+	digest, err := img.Digest()
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("identify final image %q: %w", ref, err)
 	}
-	if loadErr := loadViaRegistry(ctx, imageRef); loadErr != nil {
-		return fmt.Errorf("msb pull %s: %s: %w; registry fallback: %v", imageRef, out, err, loadErr)
-	}
-	return nil
+	return &preparedImage{
+		reference: "devsy-msb-image:" + digest.Hex,
+		image:     img,
+		cleanup:   cleanup,
+	}, nil
+}
+
+func (cliClient) EnsureImage(ctx context.Context, prepared *preparedImage) error {
+	return loadImageSnapshot(ctx, prepared.reference, prepared.image)
+}
+
+func (c cliClient) PrepareVolumes(ctx context.Context, mounts []volumeMount) error {
+	return c.ensureVolumes(ctx, mounts)
 }
 
 func (c cliClient) Create(ctx context.Context, sandbox string, spec sandboxSpec) error {
-	if err := c.ensureVolumes(ctx, spec.Mounts); err != nil {
-		return err
-	}
 	return msbRun(ctx, runArgs(sandbox, spec)...)
 }
 
@@ -89,24 +101,41 @@ func (cliClient) Find(ctx context.Context, sandbox string) (*sandboxInfo, error)
 		}
 		return nil, fmt.Errorf("inspect microsandbox VM %q: %w", sandbox, err)
 	}
+	return parseSandboxInfo(out)
+}
+
+func parseSandboxInfo(out []byte) (*sandboxInfo, error) {
 	type activeConfig struct {
 		Labels map[string]string `json:"labels"`
+		Mounts []inspectedMount  `json:"mounts"`
 	}
 	var raw struct {
-		Name         string       `json:"name"`
-		Status       string       `json:"status"`
-		CreatedAt    string       `json:"created_at"`
-		ActiveConfig activeConfig `json:"active_config"`
+		Name         string        `json:"name"`
+		Status       string        `json:"status"`
+		CreatedAt    string        `json:"created_at"`
+		ActiveConfig *activeConfig `json:"active_config"`
+		Config       *activeConfig `json:"config"`
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, fmt.Errorf("parse microsandbox inspect output: %w", err)
+	}
+	current := raw.ActiveConfig
+	if current == nil {
+		current = raw.Config
+	}
+	var labels map[string]string
+	var mounts []config.ContainerMount
+	if current != nil {
+		labels = current.Labels
+		mounts = inspectedMountDetails(current.Mounts)
 	}
 	created, _ := time.Parse(time.RFC3339Nano, raw.CreatedAt)
 	return &sandboxInfo{
 		Name:      raw.Name,
 		Running:   strings.EqualFold(raw.Status, "running"),
 		CreatedAt: created,
-		Labels:    raw.ActiveConfig.Labels,
+		Labels:    labels,
+		Mounts:    mounts,
 	}, nil
 }
 
@@ -290,72 +319,38 @@ func redactArgs(args []string) string {
 	return strings.Join(out, " ")
 }
 
-func dockerImageExists(ctx context.Context, image string) bool {
-	docker, err := exec.LookPath("docker")
-	if err != nil {
-		return false
-	}
-	// #nosec G204 -- docker path is resolved and the image ref is validated
-	return exec.CommandContext(ctx, docker, "image", "inspect", image).Run() == nil
-}
-
-func loadFromDocker(ctx context.Context, image string) error {
-	docker, err := exec.LookPath("docker")
-	if err != nil {
-		return fmt.Errorf("docker not found to load built image %q: %w", image, err)
-	}
-	// #nosec G204 -- docker/msb paths are resolved and the image ref is validated
-	save := exec.CommandContext(ctx, docker, "save", image)
-	// #nosec G204 -- docker/msb paths are resolved and the image ref is validated
-	load := exec.CommandContext(ctx, msbBinary(), "load", "-t", image)
-	pipe, err := save.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("pipe docker save: %w", err)
-	}
-	load.Stdin = pipe
-	var loadErr strings.Builder
-	load.Stderr = &loadErr
-	if err := load.Start(); err != nil {
-		return fmt.Errorf("start msb load: %w", err)
-	}
-	if err := save.Run(); err != nil {
-		// load is still running on the broken pipe; kill and reap it.
-		_ = load.Process.Kill()
-		_ = load.Wait()
-		return fmt.Errorf("docker save %q: %w", image, err)
-	}
-	if err := load.Wait(); err != nil {
-		return fmt.Errorf("msb load %q: %s: %w", image, loadErr.String(), err)
-	}
-	return nil
-}
-
-func loadViaRegistry(ctx context.Context, imageRef string) error {
+func loadImageSnapshot(ctx context.Context, imageRef string, img v1.Image) error {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
 		return fmt.Errorf("parse image reference %q: %w", imageRef, err)
 	}
-	img, err := image.GetImageForArch(ctx, imageRef, runtime.GOARCH)
+
+	// #nosec G204 -- resolved runtime binary and content-derived image reference
+	load := exec.CommandContext(ctx, msbBinary(), "load", "-t", imageRef)
+	var output strings.Builder
+	load.Stdout, load.Stderr = &output, &output
+	writer, err := load.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("pull image %q: %w", imageRef, err)
+		return fmt.Errorf("pipe image import: %w", err)
 	}
-
-	tmp, err := os.CreateTemp("", "devsy-msb-*.tar")
-	if err != nil {
-		return fmt.Errorf("create image tarball: %w", err)
+	defer func() { _ = writer.Close() }()
+	stopClose := context.AfterFunc(ctx, func() { _ = writer.Close() })
+	defer stopClose()
+	if err := load.Start(); err != nil {
+		return fmt.Errorf("start msb image import: %w", err)
 	}
-	tmpPath := tmp.Name()
-	_ = tmp.Close()
-	defer func() { _ = os.Remove(tmpPath) }()
-
-	if err := tarball.WriteToFile(tmpPath, ref, img); err != nil {
-		return fmt.Errorf("write image tarball: %w", err)
+	writeErr := tarball.Write(ref, img, writer)
+	closeErr := writer.Close()
+	if err := errors.Join(writeErr, closeErr, ctx.Err()); err != nil {
+		_ = load.Process.Kill()
+		_ = load.Wait()
+		return fmt.Errorf("stream image %q: %s: %w", imageRef, output.String(), err)
 	}
-
-	// #nosec G204 -- args are a resolved binary path and an internally-created file
-	load := exec.CommandContext(ctx, msbBinary(), "load", "-i", tmpPath, "-t", imageRef)
-	if out, err := load.CombinedOutput(); err != nil {
-		return fmt.Errorf("msb load %q: %s: %w", imageRef, out, err)
+	if err := load.Wait(); err != nil {
+		return fmt.Errorf(
+			"msb load %q: %s: %w",
+			imageRef, output.String(), errors.Join(err, ctx.Err()),
+		)
 	}
 	return nil
 }
@@ -375,4 +370,30 @@ func msbBinary() string {
 		}
 	}
 	return "msb"
+}
+
+type inspectedMount struct {
+	Type  string `json:"type"`
+	Host  string `json:"host"`
+	Guest string `json:"guest"`
+}
+
+func inspectedMountDetails(mounts []inspectedMount) []config.ContainerMount {
+	var details []config.ContainerMount
+	for _, mount := range mounts {
+		var mountType string
+		switch mount.Type {
+		case "Bind":
+			mountType = driver.MountTypeBind
+		case "Tmpfs":
+			mountType = driver.MountTypeTmpfs
+		default:
+			continue
+		}
+		details = append(
+			details,
+			config.ContainerMount{Type: mountType, Source: mount.Host, Destination: mount.Guest},
+		)
+	}
+	return details
 }
