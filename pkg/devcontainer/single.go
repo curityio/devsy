@@ -331,18 +331,15 @@ func (r *runner) mergeContainerMetadata(
 	imageMetadataConfig *config.ImageMetadataConfig,
 	p *resolveParams,
 ) (*config.MergedDevContainerConfig, error) {
-	if p.options.ExtraDevContainerPath != "" {
-		if imageMetadataConfig == nil {
-			imageMetadataConfig = &config.ImageMetadataConfig{}
-		}
-		extraConfig, parseErr := config.ParseDevContainerJSONFile(
-			ctx,
-			p.options.ExtraDevContainerPath,
-		)
-		if parseErr != nil {
-			return nil, parseErr
-		}
-		config.AddConfigToImageMetadata(extraConfig, imageMetadataConfig)
+	overlay, err := overlayForParsedConfig(ctx, p.parsedConfig, p.options.ExtraDevContainerPath)
+	if err != nil {
+		return nil, err
+	}
+	if imageMetadataConfig == nil {
+		imageMetadataConfig = &config.ImageMetadataConfig{}
+	}
+	if overlay != nil {
+		config.AddConfigToImageMetadata(overlay, imageMetadataConfig)
 	}
 
 	mergedConfig, err := config.MergeConfiguration(
@@ -353,11 +350,7 @@ func (r *runner) mergeContainerMetadata(
 		return nil, fmt.Errorf("merge config: %w", err)
 	}
 
-	if err := config.MergeExtraRemoteEnv(
-		ctx, mergedConfig, p.options.ExtraDevContainerPath,
-	); err != nil {
-		return nil, err
-	}
+	config.MergeExtraRemoteEnvConfig(mergedConfig, overlay)
 
 	return mergedConfig, nil
 }
@@ -488,12 +481,6 @@ func (r *runner) buildNewContainerConfig(
 	}
 
 	_, validatesImageRun := r.driver.(driver.ImageRunValidator)
-	if p.options.Recreate && !validatesImageRun {
-		if err := r.deleteForRecreate(ctx); err != nil {
-			return nil, nil, err
-		}
-	}
-
 	mergedConfig, err := config.MergeConfiguration(
 		activeConfig.Config,
 		buildInfo.ImageMetadata.Config,
@@ -502,21 +489,19 @@ func (r *runner) buildNewContainerConfig(
 		return nil, nil, fmt.Errorf("merge config: %w", err)
 	}
 
-	if err := config.MergeExtraRemoteEnv(
-		ctx,
-		mergedConfig,
-		p.options.ExtraDevContainerPath,
-	); err != nil {
+	overlay, err := overlayForParsedConfig(ctx, p.parsedConfig, p.options.ExtraDevContainerPath)
+	if err != nil {
 		return nil, nil, err
 	}
+	config.MergeExtraRemoteEnvConfig(mergedConfig, overlay)
 	if validatesImageRun {
 		if err := r.validateImageRun(p, activeConfig.Config, mergedConfig, buildInfo); err != nil {
 			return nil, nil, err
 		}
-		if p.options.Recreate {
-			if err := r.deleteForRecreate(ctx); err != nil {
-				return nil, nil, err
-			}
+	}
+	if p.options.Recreate {
+		if err := r.deleteForRecreate(ctx); err != nil {
+			return nil, nil, err
 		}
 	}
 
@@ -606,8 +591,9 @@ func recoveryDevContainerConfig(parsed *config.SubstitutedConfig) *config.Substi
 	}
 
 	return &config.SubstitutedConfig{
-		Config: cloned,
-		Raw:    parsed.Raw,
+		Config:  cloned,
+		Raw:     parsed.Raw,
+		Overlay: parsed.Overlay,
 	}
 }
 
@@ -632,6 +618,13 @@ func (r *runner) newContainerHostWarnings(p *resolveParams) ([]string, error) {
 // deleteForRecreate removes the existing container before recreating it.
 // The runtime policy selects deletion or stopping.
 func (r *runner) deleteForRecreate(ctx context.Context) error {
+	if r.overlayExisting != nil {
+		if err := r.teardownOverlayExisting(ctx); err != nil {
+			return err
+		}
+		r.overlayExisting = nil
+		return nil
+	}
 	switch driver.DriverRecreateMode(r.driver) {
 	case driver.RecreateDelete:
 		if err := r.Delete(ctx, DeleteOptions{}); err != nil {
@@ -813,6 +806,10 @@ func (r *runner) runContainer(
 		}
 	}
 
+	runOptions.Labels = append(
+		runOptions.Labels,
+		overlayStructureLabel+"="+structuralSignature(p.parsedConfig.Config),
+	)
 	runOptions.AllowRecreate = p.options.Recreate
 	runOptions.Env = r.addExtraEnvVars(runOptions.Env)
 	if _, ok := r.driver.(driver.RecreateRequiredDriver); ok {
