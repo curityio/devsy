@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,11 +13,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/devsy-org/devsy/pkg/image"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 )
 
@@ -45,9 +47,6 @@ func (filesystemUserResolver) ResolveImage(
 	img v1.Image,
 	user string,
 ) (*mountOwner, error) {
-	if owner, complete, err := explicitOwner(user); complete || err != nil {
-		return owner, err
-	}
 	return ownerFromImage(ctx, img, user)
 }
 
@@ -150,59 +149,202 @@ func parseImageUserIdentity(user string) (imageUserIdentity, error) {
 	}, nil
 }
 
-func explicitOwner(user string) (*mountOwner, bool, error) {
-	identity, err := parseImageUserIdentity(user)
-	if err != nil {
-		return nil, false, err
-	}
+func (identity imageUserIdentity) explicitOwner() (*mountOwner, bool) {
 	if identity.group == "" {
 		if identity.name == rootUser || (identity.numericUID && identity.uid == 0) {
-			return &mountOwner{}, true, nil
+			return &mountOwner{}, true
 		}
 	}
 	if identity.numericUID && identity.numericGID {
-		return &mountOwner{UID: identity.uid, GID: identity.gid}, true, nil
+		return &mountOwner{UID: identity.uid, GID: identity.gid}, true
 	}
-	return nil, false, nil
+	return nil, false
+}
+
+func (identity imageUserIdentity) accountFiles() map[string]bool {
+	wanted := map[string]bool{}
+	if !identity.numericUID || identity.group == "" {
+		wanted[passwdPath] = true
+	}
+	if identity.group != "" && !identity.numericGID {
+		wanted[groupPath] = true
+	}
+	return wanted
 }
 
 func ownerFromImage(ctx context.Context, img v1.Image, user string) (*mountOwner, error) {
-	if owner, complete, err := explicitOwner(user); complete || err != nil {
-		return owner, err
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	accounts, err := imageAccountFiles(ctx, img)
+	identity, err := parseImageUserIdentity(user)
+	if err != nil {
+		return nil, err
+	}
+	if owner, complete := identity.explicitOwner(); complete {
+		return owner, nil
+	}
+	if img == nil {
+		return nil, errors.New("workspace owner resolution requires a prepared image")
+	}
+	accounts, err := imageAccountFiles(ctx, img, identity.accountFiles())
 	if err != nil {
 		return nil, err
 	}
 	return ownerFromAccounts(user, accounts[passwdPath], accounts[groupPath])
 }
 
-func imageAccountFiles(ctx context.Context, img v1.Image) (map[string]string, error) {
-	stream := mutate.Extract(img)
-	defer func() { _ = stream.Close() }()
+func imageAccountFiles(
+	ctx context.Context,
+	img v1.Image,
+	wanted map[string]bool,
+) (map[string]string, error) {
+	layers, err := img.Layers()
+	if err != nil {
+		return nil, fmt.Errorf("read image layers: %w", errors.Join(err, ctx.Err()))
+	}
 	accounts := map[string]string{}
-	reader := tar.NewReader(stream)
-	for len(accounts) < 2 {
+	hidden := map[string]bool{}
+	for i := len(layers) - 1; i >= 0 && len(hidden) < len(wanted); i-- {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		header, err := reader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read image accounts: %w", err)
-		}
-		file := path.Clean(strings.TrimPrefix(header.Name, "/"))
-		if file != passwdPath && file != groupPath {
-			continue
-		}
-		accounts[file], err = readAccountFile(reader, header)
+		files, removed, err := layerAccountFiles(ctx, layers[i], accountLayer{
+			accounts: map[string]string{},
+			removed:  map[string]bool{},
+			hidden:   hidden,
+			wanted:   wanted,
+		})
 		if err != nil {
 			return nil, err
 		}
+		for filename, data := range files {
+			accounts[filename], hidden[filename] = data, true
+		}
+		// Whiteouts hide lower layers, not replacements in this layer.
+		for filename := range removed {
+			hidden[filename] = true
+		}
 	}
-	return accounts, nil
+	return accounts, ctx.Err()
+}
+
+func layerAccountFiles(
+	ctx context.Context,
+	layer v1.Layer,
+	files accountLayer,
+) (map[string]string, map[string]bool, error) {
+	stream, cleanup, err := openAccountLayer(ctx, layer)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer cleanup()
+	reader := tar.NewReader(accountContextReader{ctx: ctx, Reader: stream})
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		header, err := reader.Next()
+		if err == io.EOF {
+			return files.accounts, files.removed, ctx.Err()
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("read image accounts: %w", errors.Join(err, ctx.Err()))
+		}
+		if err := files.collect(reader, header); err != nil {
+			return nil, nil, errors.Join(err, ctx.Err())
+		}
+	}
+}
+
+func openAccountLayer(ctx context.Context, layer v1.Layer) (io.ReadCloser, func(), error) {
+	source, err := layer.Compressed()
+	if err != nil {
+		return nil, nil, fmt.Errorf("open image layer: %w", errors.Join(err, ctx.Err()))
+	}
+	closeSource := sync.OnceFunc(func() { _ = source.Close() })
+	// Cancel the source read without closing a decoder concurrently with Read.
+	stopClose := context.AfterFunc(ctx, closeSource)
+	cleanupSource := func() { stopClose(); closeSource() }
+	decoded, err := partial.CompressedToLayer(accountCompressedLayer{Layer: layer, reader: source})
+	if err != nil {
+		cleanupSource()
+		return nil, nil, fmt.Errorf("prepare image layer decoder: %w", errors.Join(err, ctx.Err()))
+	}
+	stream, err := decoded.Uncompressed()
+	if err != nil {
+		cleanupSource()
+		return nil, nil, fmt.Errorf("decode image layer: %w", errors.Join(err, ctx.Err()))
+	}
+	return stream, func() { defer cleanupSource(); _ = stream.Close() }, nil
+}
+
+type accountCompressedLayer struct {
+	v1.Layer
+	reader io.Reader
+}
+
+type accountContextReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (reader accountContextReader) Read(buf []byte) (int, error) {
+	if err := reader.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return reader.Reader.Read(buf)
+}
+
+func (layer accountCompressedLayer) Compressed() (io.ReadCloser, error) {
+	return io.NopCloser(layer.reader), nil
+}
+
+type accountLayer struct {
+	accounts map[string]string
+	removed  map[string]bool
+	hidden   map[string]bool
+	wanted   map[string]bool
+}
+
+func (files accountLayer) collect(reader io.Reader, header *tar.Header) error {
+	filename := path.Clean(strings.TrimPrefix(header.Name, "/"))
+	files.hideWhiteout(filename)
+	if filename == "etc" && header.Typeflag != tar.TypeDir {
+		return errors.New("final image /etc is not a regular account directory")
+	}
+	if !files.wanted[filename] {
+		return nil
+	}
+	if _, seen := files.accounts[filename]; seen || files.hidden[filename] {
+		return nil
+	}
+	data, err := readAccountFile(reader, header)
+	if err != nil {
+		return err
+	}
+	files.accounts[filename] = data
+	return nil
+}
+
+func (files accountLayer) hideWhiteout(filename string) {
+	for _, target := range accountWhiteoutTargets(filename) {
+		if files.wanted[target] {
+			files.removed[target] = true
+		}
+	}
+}
+
+func accountWhiteoutTargets(filename string) []string {
+	switch filename {
+	case ".wh.etc", ".wh..wh..opq", "etc/.wh..wh..opq":
+		return []string{passwdPath, groupPath}
+	case "etc/.wh.passwd":
+		return []string{passwdPath}
+	case "etc/.wh.group":
+		return []string{groupPath}
+	default:
+		return nil
+	}
 }
 
 func readAccountFile(reader io.Reader, header *tar.Header) (string, error) {
