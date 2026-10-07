@@ -3,11 +3,15 @@ package devcontainer
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/devsy-org/devsy/pkg/devcontainer/config"
+	"github.com/devsy-org/devsy/pkg/docker"
 	"github.com/devsy-org/devsy/pkg/driver"
 	"github.com/devsy-org/devsy/pkg/provider"
+	"github.com/devsy-org/devsy/pkg/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -228,4 +232,86 @@ func TestImageRuntimeDoesNotNeedImageBackend(t *testing.T) {
 	assert.Equal(t, r.id, d.params.WorkspaceID)
 	assert.Equal(t, "runtime-image", d.params.Options.Image)
 	assert.Nil(t, r.imageBackend)
+}
+
+type validatingImageRuntime struct {
+	*mockDriver
+	validationErr    error
+	validationParams *driver.RunImageDevContainerParams
+}
+
+func (d *validatingImageRuntime) ValidateRunImageDevContainer(
+	params *driver.RunImageDevContainerParams,
+) error {
+	d.validationParams = params
+	return d.validationErr
+}
+
+func TestImageRunValidationPreservesContainerBeforeRecreate(t *testing.T) {
+	for _, reject := range []bool{true, false} {
+		t.Run(fmt.Sprintf("reject=%t", reject), func(t *testing.T) {
+			sentinel := errors.New("unsupported creation settings")
+			d := &validatingImageRuntime{mockDriver: &mockDriver{}}
+			if reject {
+				d.validationErr = sentinel
+			}
+			r := newTestRunner(d)
+			r.workspaceConfig.Workspace = &provider.Workspace{ID: r.id, UID: "workspace-uid"}
+			r.imageBackend = &separateImages{details: &config.ImageDetails{ID: "image"}}
+			r.reporter = status.Nop()
+			p := recreateResolveParams()
+			p.parsedConfig.Config.Image = "alpine"
+			p.parsedConfig.Raw = config.CloneDevContainerConfig(p.parsedConfig.Config)
+			p.substitutionContext = &config.SubstitutionContext{}
+			_, _, err := r.buildNewContainerConfig(context.Background(), p)
+			if reject {
+				require.ErrorIs(t, err, sentinel)
+			} else {
+				require.NoError(t, err)
+			}
+			require.NotNil(t, d.validationParams)
+			require.Equal(t, r.id, d.validationParams.WorkspaceID)
+			require.NotEmpty(t, d.validationParams.Options.Image)
+			assert.Equal(t, !reject, d.stopCalled)
+			assert.False(t, d.deleteCalled)
+		})
+	}
+}
+
+type dockerDiscoveryRuntime struct {
+	*mockDriver
+}
+
+func (d *dockerDiscoveryRuntime) DockerHelper() (*docker.DockerHelper, error) {
+	return nil, nil
+}
+
+func TestWorkspaceDiscoveryUsesRuntimeCapability(t *testing.T) {
+	for _, dockerBacked := range []bool{false, true} {
+		for _, withImages := range []bool{false, true} {
+			t.Run(fmt.Sprintf("docker=%t/images=%t", dockerBacked, withImages), func(t *testing.T) {
+				existing := runningContainerDetails()
+				base := &mockDriver{findResult: existing}
+				var runtimeDriver driver.Driver = base
+				if dockerBacked {
+					runtimeDriver = &dockerDiscoveryRuntime{mockDriver: base}
+				}
+				r := newTestRunner(runtimeDriver)
+				r.workspaceConfig.Agent.Docker.Path = filepath.Join(t.TempDir(), "missing-docker")
+				if withImages {
+					r.imageBackend = &separateImages{}
+				}
+				found, err := r.findExistingDevContainer(context.Background())
+				require.NoError(t, err)
+				if dockerBacked {
+					assert.Nil(t, found)
+				} else {
+					assert.Same(t, existing, found)
+					base.findErr = errors.New("runtime discovery failed")
+					_, err = r.findExistingDevContainer(context.Background())
+					assert.ErrorIs(t, err, base.findErr)
+				}
+			})
+		}
+	}
 }

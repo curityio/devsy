@@ -231,18 +231,17 @@ func (r *runner) provisioningPreflightForRecreate(ctx context.Context, options U
 	return driver.DriverProvisioningPreflight(ctx, r.driver)
 }
 
-// findExistingDevContainer looks up the dev container, first checking that the
-// configured docker command exists. Returns nil details (without error) when
-// docker is unavailable.
 func (r *runner) findExistingDevContainer(
 	ctx context.Context,
 ) (*config.ContainerDetails, error) {
-	dockerCmd := "docker"
-	if r.workspaceConfig.Agent.Docker.Path != "" {
-		dockerCmd = r.workspaceConfig.Agent.Docker.Path
-	}
-	if !command.Exists(dockerCmd) {
-		return nil, nil
+	if _, dockerBacked := r.driver.(driver.DockerHelperProvider); dockerBacked {
+		dockerCmd := "docker"
+		if r.workspaceConfig.Agent.Docker.Path != "" {
+			dockerCmd = r.workspaceConfig.Agent.Docker.Path
+		}
+		if !command.Exists(dockerCmd) {
+			return nil, nil
+		}
 	}
 
 	containerDetails, err := r.driver.FindDevContainer(ctx, r.id)
@@ -488,7 +487,8 @@ func (r *runner) buildNewContainerConfig(
 		r.recovering = true
 	}
 
-	if p.options.Recreate {
+	_, validatesImageRun := r.driver.(driver.ImageRunValidator)
+	if p.options.Recreate && !validatesImageRun {
 		if err := r.deleteForRecreate(ctx); err != nil {
 			return nil, nil, err
 		}
@@ -509,8 +509,51 @@ func (r *runner) buildNewContainerConfig(
 	); err != nil {
 		return nil, nil, err
 	}
+	if validatesImageRun {
+		if err := r.validateImageRun(p, activeConfig.Config, mergedConfig, buildInfo); err != nil {
+			return nil, nil, err
+		}
+		if p.options.Recreate {
+			if err := r.deleteForRecreate(ctx); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
 
 	return buildInfo, mergedConfig, nil
+}
+
+func (r *runner) validateImageRun(
+	p *resolveParams,
+	parsedConfig *config.DevContainerConfig,
+	mergedConfig *config.MergedDevContainerConfig,
+	buildInfo *config.BuildInfo,
+) error {
+	var options *driver.RunOptions
+	var err error
+	if buildInfo.Dockerless != nil {
+		options, err = r.getDockerlessRunOptions(
+			mergedConfig,
+			p.substitutionContext,
+			buildInfo,
+			len(p.options.SecretsMount) > 0,
+		)
+	} else {
+		options, err = r.getRunOptions(
+			mergedConfig,
+			p.substitutionContext,
+			buildInfo,
+			len(p.options.SecretsMount) > 0,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("validate image run options: %w", err)
+	}
+	return r.driver.(driver.ImageRunValidator).ValidateRunImageDevContainer(
+		&driver.RunImageDevContainerParams{
+			WorkspaceID: r.id, Options: options, ParsedConfig: parsedConfig,
+		},
+	)
 }
 
 // buildRecoveryContainerConfig rebuilds from a stripped-down config after a
