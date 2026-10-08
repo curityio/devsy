@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,7 @@ import (
 const (
 	readmeFile  = "README.md"
 	emptyFolder = "empty"
+	worktrees   = ".claude/worktrees/"
 )
 
 // testTree is the set of files created in the archived folder by newTestTree.
@@ -110,7 +112,7 @@ var writeTarExcludeTests = []writeTarExcludeTest{
 	},
 	{
 		name:     "directory pattern excludes the directory and its contents",
-		excludes: []string{".claude/worktrees/"},
+		excludes: []string{worktrees},
 		expected: without(allEntries(),
 			".claude/worktrees/feature/src/main.go",
 			".claude/worktrees/feature/keep.txt",
@@ -142,7 +144,12 @@ var writeTarExcludeTests = []writeTarExcludeTest{
 	},
 	{
 		name:     "negation re-includes a file inside an excluded directory",
-		excludes: []string{".claude/worktrees/", "!.claude/worktrees/feature/keep.txt"},
+		excludes: []string{worktrees, "!.claude/worktrees/feature/keep.txt"},
+		expected: without(allEntries(), ".claude/worktrees/feature/src/main.go"),
+	},
+	{
+		name:     "negation with double star re-includes a file inside an excluded directory",
+		excludes: []string{worktrees, "!**/keep.txt"},
 		expected: without(allEntries(), ".claude/worktrees/feature/src/main.go"),
 	},
 	{
@@ -180,8 +187,51 @@ func TestWriteTarExclude(t *testing.T) {
 func TestWriteTarExcludeSingleFile(t *testing.T) {
 	root := newTestTree(t)
 
-	entries := tarEntries(t, filepath.Join(root, readmeFile), []string{"docs"})
-	assert.Equal(t, []string{readmeFile}, entries)
+	assert.Equal(
+		t,
+		[]string{readmeFile},
+		tarEntries(t, filepath.Join(root, readmeFile), []string{"docs"}),
+	)
+	assert.Empty(t, tarEntries(t, filepath.Join(root, readmeFile), []string{readmeFile}))
+}
+
+func TestArchiverMayReincludeBelow(t *testing.T) {
+	archiver, err := NewArchiver(t.TempDir(), nil, []string{
+		worktrees, "**/node_modules/", "!.claude/worktrees/feature/keep.txt",
+	})
+	require.NoError(t, err)
+
+	assert.True(t, archiver.mayReincludeBelow(".claude/worktrees"))
+	assert.False(t, archiver.mayReincludeBelow("web/node_modules"))
+}
+
+func TestPatternMayMatchBelow(t *testing.T) {
+	const keep = "a/b/keep.txt"
+	const ab = "a/b"
+	tests := []struct {
+		pattern  string
+		dir      string
+		expected bool
+	}{
+		{pattern: keep, dir: "a", expected: true},
+		{pattern: keep, dir: ab, expected: true},
+		{pattern: "a/*/keep.txt", dir: ab, expected: true},
+		{pattern: "**/keep.txt", dir: "x/y", expected: true},
+		{pattern: "a/**", dir: "z", expected: true},
+		{pattern: "a/[b/keep.txt", dir: "a/c", expected: true},
+		{pattern: keep, dir: "c", expected: false},
+		{pattern: keep, dir: "a/c", expected: false},
+		{pattern: ab, dir: ab, expected: false},
+		{pattern: "keep.txt", dir: "a", expected: false},
+		{pattern: keep, dir: keep, expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.pattern+" below "+tt.dir, func(t *testing.T) {
+			assert.Equal(t, tt.expected, patternMayMatchBelow(
+				strings.Split(tt.pattern, "/"), strings.Split(tt.dir, "/")))
+		})
+	}
 }
 
 func TestWriteTarExcludeInvalidPattern(t *testing.T) {

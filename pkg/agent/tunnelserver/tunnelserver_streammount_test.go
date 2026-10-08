@@ -19,6 +19,8 @@ import (
 	"google.golang.org/grpc"
 )
 
+const srcMainGo = "src/main.go"
+
 // mockStreamMountServer collects the chunks sent by StreamMount.
 type mockStreamMountServer struct {
 	grpc.ServerStream
@@ -70,7 +72,7 @@ func streamMountEntries(t *testing.T, server *tunnelServer, mount *config.Mount)
 }
 
 // newSetupInfo returns a setup result with a workspace folder and another bind
-// mount, both with a .devpodignore that excludes node_modules.
+// mount, both with an ignore file that excludes node_modules.
 func newSetupInfo(t *testing.T) *config.Result {
 	t.Helper()
 
@@ -78,7 +80,7 @@ func newSetupInfo(t *testing.T) *config.Result {
 
 	workspaceFolder := t.TempDir()
 	writeFiles(t, workspaceFolder,
-		"src/main.go",
+		srcMainGo,
 		"web/node_modules/lib/index.js",
 		".claude/worktrees/feature/main.go",
 	)
@@ -138,7 +140,7 @@ func TestStreamMount_WorkspaceMountHonoursIgnoreFile(t *testing.T) {
 
 	entries := streamMountEntries(t, server, config.GetWorkspaceMount(setupInfo))
 
-	assert.Equal(t, []string{pkgconfig.IgnoreFileName, "src/main.go"}, entries)
+	assert.Equal(t, []string{pkgconfig.IgnoreFileName, srcMainGo}, entries)
 }
 
 func TestStreamMount_OtherBindMountIsStreamedWhole(t *testing.T) {
@@ -163,7 +165,30 @@ func TestStreamMount_WithoutWorkspaceMountNothingIsExcluded(t *testing.T) {
 	assert.Equal(t, []string{
 		".claude/worktrees/feature/main.go",
 		pkgconfig.IgnoreFileName,
-		"src/main.go",
+		srcMainGo,
+		"web/node_modules/lib/index.js",
+	}, entries)
+}
+
+func TestStreamMount_InvalidIgnoreFileExcludesNothing(t *testing.T) {
+	setupInfo := newSetupInfo(t)
+	workspaceMount := config.GetWorkspaceMount(setupInfo)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(
+			workspaceMount.Source,
+			pkgconfig.IgnoreFileName,
+		),
+		[]byte("**/node_modules/\n!\n"),
+		0o600,
+	))
+	server := newSetupServer(setupInfo)
+
+	entries := streamMountEntries(t, server, workspaceMount)
+
+	assert.Equal(t, []string{
+		".claude/worktrees/feature/main.go",
+		pkgconfig.IgnoreFileName,
+		srcMainGo,
 		"web/node_modules/lib/index.js",
 	}, entries)
 }

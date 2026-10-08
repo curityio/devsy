@@ -10,6 +10,8 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/moby/patternmatcher"
@@ -70,6 +72,8 @@ type Archiver struct {
 	// excludes holds the exclude patterns, with .dockerignore semantics. It is
 	// nil when nothing is excluded.
 	excludes *patternmatcher.PatternMatcher
+	// reincludes holds the components of each negation (!) pattern.
+	reincludes [][]string
 }
 
 // NewArchiver creates a new archiver. excludedPaths are patterns relative to
@@ -89,7 +93,23 @@ func NewArchiver(basePath string, writer *tar.Writer, excludedPaths []string) (*
 		writer:       writer,
 		writtenFiles: map[string]bool{},
 		excludes:     excludes,
+		reincludes:   reincludePatterns(excludes),
 	}, nil
+}
+
+// reincludePatterns returns the components of each negation pattern.
+func reincludePatterns(excludes *patternmatcher.PatternMatcher) [][]string {
+	if excludes == nil || !excludes.Exclusions() {
+		return nil
+	}
+
+	var reincludes [][]string
+	for _, p := range excludes.Patterns() {
+		if p.Exclusion() {
+			reincludes = append(reincludes, strings.Split(filepath.ToSlash(p.String()), "/"))
+		}
+	}
+	return reincludes
 }
 
 // AddToArchive adds a new path to the archive.
@@ -117,7 +137,7 @@ func (a *Archiver) addToArchive(relativePath string, parentInfo patternmatcher.M
 	if stat.IsDir() {
 		// Skip an excluded folder without reading it, unless a negation
 		// pattern could re-include something below it.
-		if excluded && !a.excludes.Exclusions() {
+		if excluded && !a.mayReincludeBelow(relativePath) {
 			return nil
 		}
 
@@ -128,6 +148,40 @@ func (a *Archiver) addToArchive(relativePath string, parentInfo patternmatcher.M
 		return nil
 	}
 	return a.tarFile(relativePath, stat)
+}
+
+// mayReincludeBelow reports whether a negation pattern could match a path
+// inside the excluded folder dir. It may return true for a pattern that turns
+// out not to match, but never false for one that does.
+func (a *Archiver) mayReincludeBelow(dir string) bool {
+	dirComponents := strings.Split(path.Clean(filepath.ToSlash(dir)), "/")
+	for _, pattern := range a.reincludes {
+		if patternMayMatchBelow(pattern, dirComponents) {
+			return true
+		}
+	}
+	return false
+}
+
+// patternMayMatchBelow reports whether pattern could match a path below the
+// folder dir, both given as path components.
+func patternMayMatchBelow(pattern, dir []string) bool {
+	// "**" matches any number of folders, so do not try to rule it out
+	if slices.Contains(pattern, "**") {
+		return true
+	}
+	// A pattern matching dir itself, or one of its parents, was already
+	// applied to dir, which is still excluded
+	if len(pattern) <= len(dir) {
+		return false
+	}
+	for i, component := range dir {
+		matched, err := path.Match(pattern[i], component)
+		if err != nil || !matched {
+			return err != nil
+		}
+	}
+	return true
 }
 
 // isExcluded matches relativePath against the exclude patterns. It also

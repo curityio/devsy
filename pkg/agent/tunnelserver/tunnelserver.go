@@ -33,6 +33,7 @@ import (
 	provider2 "github.com/devsy-org/devsy/pkg/provider"
 	"github.com/devsy-org/devsy/pkg/status"
 	"github.com/devsy-org/devsy/pkg/stdio"
+	"github.com/moby/patternmatcher"
 	"github.com/moby/patternmatcher/ignorefile"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -724,6 +725,9 @@ func readIgnoreFile(folder string) []string {
 	defer func() { _ = f.Close() }()
 
 	excludes, err := ignorefile.ReadAll(f)
+	if err == nil {
+		_, err = patternmatcher.New(excludes)
+	}
 	if err != nil {
 		log.Warnf("error reading %s, nothing is excluded: error=%v", ignoreFile, err)
 		return nil
