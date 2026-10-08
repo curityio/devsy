@@ -1,6 +1,7 @@
 package copy
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -58,6 +59,17 @@ func (fs ChownFailures) Unwrap() []error {
 func (fs ChownFailures) AllDenied() bool {
 	for _, f := range fs {
 		if !DeniedByFilesystem(f.Err) {
+			return false
+		}
+	}
+	return len(fs) > 0
+}
+
+// AllVanished reports whether every failure is an entry that no longer
+// exists, e.g. a socket directory removed before or during the walk.
+func (fs ChownFailures) AllVanished() bool {
+	for _, f := range fs {
+		if !errors.Is(f.Err, os.ErrNotExist) {
 			return false
 		}
 	}

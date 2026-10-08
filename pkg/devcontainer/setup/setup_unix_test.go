@@ -4,10 +4,13 @@ package setup
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/devsy-org/devsy/pkg/devcontainer/config"
 )
 
 // TestWriteResultFileTo_RejectsSymlinkWithoutFollowing guards against a
@@ -60,5 +63,43 @@ func TestWriteResultFileTo_RejectsFIFOWithoutBlocking(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("writeResultFileTo blocked for 2s+ opening a FIFO with no peer")
+	}
+}
+
+func resultForRemoteUser(name string) *config.Result {
+	return &config.Result{
+		MergedConfig: &config.MergedDevContainerConfig{
+			DevContainerConfigBase: config.DevContainerConfigBase{RemoteUser: name},
+		},
+	}
+}
+
+// TestChownAgentSock_VanishedSocketDirIsNotAnError covers an SSH_AUTH_SOCK
+// whose directory went away with the connection that created it.
+func TestChownAgentSock_VanishedSocketDirIsNotAnError(t *testing.T) {
+	currentUser, err := user.Current()
+	if err != nil {
+		t.Fatalf("current user: %v", err)
+	}
+	sock := filepath.Join(t.TempDir(), "devsy-ssh-agent-gone", "listener.sock")
+	t.Setenv("SSH_AUTH_SOCK", sock)
+
+	if err := chownAgentSock(resultForRemoteUser(currentUser.Username)); err != nil {
+		t.Errorf("chownAgentSock() = %v, want nil", err)
+	}
+}
+
+func TestChownAgentSock_DeniedChownIsAnError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires an unprivileged user")
+	}
+	dir := filepath.Join(t.TempDir(), "devsy-ssh-agent-present")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Setenv("SSH_AUTH_SOCK", filepath.Join(dir, "listener.sock"))
+
+	if err := chownAgentSock(resultForRemoteUser("root")); err == nil {
+		t.Error("chownAgentSock() = nil, want the chown failure")
 	}
 }

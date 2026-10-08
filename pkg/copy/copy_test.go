@@ -271,3 +271,44 @@ func TestChownRSameOwnerSucceeds(t *testing.T) {
 		t.Fatalf("ChownR same owner: %v", err)
 	}
 }
+
+func TestChownRMissingRootIsVanished(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "gone")
+
+	err := ChownR(missing, currentUserName(t))
+	var failures ChownFailures
+	if !errors.As(err, &failures) {
+		t.Fatalf("ChownR err = %v, want ChownFailures", err)
+	}
+	if !failures.AllVanished() {
+		t.Errorf("AllVanished() = false for %v", failures)
+	}
+}
+
+func TestAllVanishedRequiresEveryFailureToBeNotExist(t *testing.T) {
+	notExist := ChownFailure{Path: "/gone", Err: &os.PathError{
+		Op: "lstat", Path: "/gone", Err: syscall.ENOENT,
+	}}
+	denied := ChownFailure{Path: "/denied", Err: &os.PathError{
+		Op: "lchown", Path: "/denied", Err: syscall.EPERM,
+	}}
+
+	tests := []struct {
+		name     string
+		failures ChownFailures
+		want     bool
+	}{
+		{name: "empty", failures: ChownFailures{}, want: false},
+		{name: "nil", failures: nil, want: false},
+		{name: "only not exist", failures: ChownFailures{notExist}, want: true},
+		{name: "not exist and denied", failures: ChownFailures{notExist, denied}, want: false},
+		{name: "only denied", failures: ChownFailures{denied}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.failures.AllVanished(); got != tt.want {
+				t.Errorf("AllVanished() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

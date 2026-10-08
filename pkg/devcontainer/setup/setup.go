@@ -725,11 +725,20 @@ func buildEnvMarker(
 func chownAgentSock(setupInfo *config.Result) error {
 	user := config.GetRemoteUser(setupInfo)
 	agentSockFile := os.Getenv("SSH_AUTH_SOCK")
-	if agentSockFile != "" {
-		err := copy2.ChownR(filepath.Dir(agentSockFile), user)
-		if err != nil && !os.IsNotExist(err) {
-			return err
-		}
+	if agentSockFile == "" {
+		return nil
+	}
+
+	err := copy2.ChownR(filepath.Dir(agentSockFile), user)
+	var failures copy2.ChownFailures
+	switch {
+	case err == nil:
+	case errors.As(err, &failures) && failures.AllVanished():
+		// The socket directory belongs to an SSH connection that may have
+		// closed, taking the directory with it: nothing is left to chown.
+		log.Debugf("skip chown: ssh agent socket %s is gone: %v", agentSockFile, err)
+	default:
+		return err
 	}
 
 	return nil
