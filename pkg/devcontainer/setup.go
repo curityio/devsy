@@ -548,7 +548,7 @@ func (r *runner) executeSetup(
 			stdin,
 			r.workspaceConfig.Agent.InjectGitCredentials != stringFalse,
 			r.workspaceConfig.Agent.InjectDockerCredentials != stringFalse,
-			config.GetMounts(result),
+			result,
 			tunnelserver.WithPlatformOptions(&r.workspaceConfig.CLIOptions.Platform),
 			tunnelserver.WithSecrets(
 				secretsEnv,

@@ -81,19 +81,28 @@ func RunSetupServer(
 	reader io.Reader,
 	writer io.WriteCloser,
 	allowGitCredentials, allowDockerCredentials bool,
-	mounts []*config.Mount,
+	setupInfo *config.Result,
 	options ...Option,
 ) (*config.Result, error) {
 	options = append(options,
-		WithMounts(mounts),
 		WithAllowGitCredentials(allowGitCredentials),
 		WithAllowDockerCredentials(allowDockerCredentials),
+	)
+	tunnelServ := newSetupServer(setupInfo, options...)
+
+	return tunnelServ.RunWithResult(ctx, reader, writer)
+}
+
+func newSetupServer(setupInfo *config.Result, options ...Option) *tunnelServer {
+	options = append(options,
+		WithMounts(config.GetMounts(setupInfo)),
+		WithWorkspaceMount(config.GetWorkspaceMount(setupInfo)),
 		WithAllowKubeConfig(true),
 	)
 	tunnelServ := New(options...)
 	tunnelServ.allowPlatformOptions = true
 
-	return tunnelServ.RunWithResult(ctx, reader, writer)
+	return tunnelServ
 }
 
 func New(options ...Option) *tunnelServer {
@@ -110,6 +119,8 @@ type tunnelServer struct {
 
 	// stream mounts
 	mounts []*config.Mount
+	// workspaceMount is the mount of the workspace folder, if known
+	workspaceMount *config.Mount
 
 	forwarder              netstat.Forwarder
 	allowGitCredentials    bool
@@ -495,18 +506,10 @@ func (t *tunnelServer) StreamWorkspace(
 		return fmt.Errorf("workspace is nil")
 	}
 
-	// Get .devsyignore files to exclude
-	excludes := []string{}
-	f, err := os.Open(filepath.Join(t.workspace.Source.LocalFolder, pkgconfig.IgnoreFileName))
-	if err == nil {
-		excludes, err = ignorefile.ReadAll(f)
-		if err != nil {
-			log.Warnf("error reading %s file: error=%v", pkgconfig.IgnoreFileName, err)
-		}
-	}
+	excludes := readIgnoreFile(t.workspace.Source.LocalFolder)
 
 	buf := bufio.NewWriterSize(NewStreamWriter(stream), 10*1024)
-	err = extract.WriteTarExclude(buf, t.workspace.Source.LocalFolder, false, excludes)
+	err := extract.WriteTarExclude(buf, t.workspace.Source.LocalFolder, false, excludes)
 	if err != nil {
 		return err
 	}
@@ -537,7 +540,17 @@ func (t *tunnelServer) StreamMount(
 		return fmt.Errorf("mount %s is not allowed to download", message.Mount)
 	}
 
-	excludes := t.workspaceIgnoreExcludes()
+	// The ignore file only applies to the workspace folder, other bind mounts
+	// are streamed whole
+	var excludes []string
+	if t.workspaceMount != nil && mount.String() == t.workspaceMount.String() {
+		excludes = readIgnoreFile(mount.Source)
+	} else {
+		log.Debugf(
+			"stream mount %s without excludes, it is not the workspace mount",
+			mount.String(),
+		)
+	}
 
 	buf := bufio.NewWriterSize(NewStreamWriter(stream), 10*1024)
 	err := extract.WriteTarExclude(buf, mount.Source, false, excludes)
@@ -676,20 +689,10 @@ func (t *tunnelServer) platformStreamBlocked() bool {
 }
 
 func (t *tunnelServer) workspaceIgnoreExcludes() []string {
-	excludes := []string{}
 	if t.workspace == nil {
-		return excludes
+		return nil
 	}
-
-	f, err := os.Open(filepath.Join(t.workspace.Source.LocalFolder, pkgconfig.IgnoreFileName))
-	if err == nil {
-		defer func() { _ = f.Close() }()
-		excludes, err = ignorefile.ReadAll(f)
-		if err != nil {
-			log.Warnf("error reading %s file: error=%v", pkgconfig.IgnoreFileName, err)
-		}
-	}
-	return excludes
+	return readIgnoreFile(t.workspace.Source.LocalFolder)
 }
 
 func (t *tunnelServer) getResult() *config.Result {
@@ -702,4 +705,30 @@ func (t *tunnelServer) setResult(result *config.Result) {
 	t.resultMu.Lock()
 	defer t.resultMu.Unlock()
 	t.result = result
+}
+
+// readIgnoreFile returns the exclude patterns of the ignore file in folder, or
+// nil if there is none.
+func readIgnoreFile(folder string) []string {
+	ignoreFile := filepath.Join(folder, pkgconfig.IgnoreFileName)
+	// #nosec G304 -- the ignore file of the workspace folder, which is streamed anyway
+	f, err := os.Open(ignoreFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Debugf("no %s found, nothing is excluded", ignoreFile)
+		} else {
+			log.Warnf("error opening %s, nothing is excluded: error=%v", ignoreFile, err)
+		}
+		return nil
+	}
+	defer func() { _ = f.Close() }()
+
+	excludes, err := ignorefile.ReadAll(f)
+	if err != nil {
+		log.Warnf("error reading %s, nothing is excluded: error=%v", ignoreFile, err)
+		return nil
+	}
+
+	log.Debugf("loaded %d exclude patterns from %s: %v", len(excludes), ignoreFile, excludes)
+	return excludes
 }
