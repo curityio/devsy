@@ -6,6 +6,9 @@ import (
 	"testing"
 )
 
+// TestFinishBuild_ImageEnvWinsOverCredentialsCleanup checks that the
+// credentials cleanup runs before the image env is applied, so the image's
+// PATH is the one left in the process.
 func TestFinishBuild_ImageEnvWinsOverCredentialsCleanup(t *testing.T) {
 	t.Setenv("PATH", "/builder/bin")
 
@@ -30,6 +33,9 @@ func TestFinishBuild_ImageEnvWinsOverCredentialsCleanup(t *testing.T) {
 	}
 }
 
+// TestFinishBuild_FailedBuildCleansUpAndSkipsImageEnv checks that a failed
+// build still runs the cleanup once, returns the build error and never
+// applies the image env.
 func TestFinishBuild_FailedBuildCleansUpAndSkipsImageEnv(t *testing.T) {
 	buildErr := errors.New("build failed")
 	cleanups := 0
@@ -52,6 +58,8 @@ func TestFinishBuild_FailedBuildCleansUpAndSkipsImageEnv(t *testing.T) {
 	}
 }
 
+// TestFinishBuild_NoCleanup checks that a nil cleanup is tolerated and the
+// image env is still applied.
 func TestFinishBuild_NoCleanup(t *testing.T) {
 	applied := false
 

@@ -64,6 +64,9 @@ func DockerlessBuild(opts DockerlessBuildOptions) error {
 	return executeBuild(opts)
 }
 
+// executeBuild runs the dockerless image build with the builder's registry
+// credentials in place and, on success, applies the built image's environment
+// to the current process.
 func executeBuild(opts DockerlessBuildOptions) error {
 	buildContext := GetDockerlessBuildContext()
 	if err := prepareBuildDirectory(buildContext); err != nil {

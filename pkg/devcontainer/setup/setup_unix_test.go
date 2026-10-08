@@ -66,6 +66,8 @@ func TestWriteResultFileTo_RejectsFIFOWithoutBlocking(t *testing.T) {
 	}
 }
 
+// resultForRemoteUser returns a minimal setup result whose remote user is
+// name.
 func resultForRemoteUser(name string) *config.Result {
 	return &config.Result{
 		MergedConfig: &config.MergedDevContainerConfig{
@@ -89,6 +91,8 @@ func TestChownAgentSock_VanishedSocketDirIsNotAnError(t *testing.T) {
 	}
 }
 
+// TestChownAgentSock_DeniedChownIsAnError checks that a chown that fails for
+// a reason other than a vanished directory is still reported.
 func TestChownAgentSock_DeniedChownIsAnError(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("requires an unprivileged user")

@@ -272,6 +272,8 @@ func TestChownRSameOwnerSucceeds(t *testing.T) {
 	}
 }
 
+// TestChownRMissingRootIsVanished checks that chowning a path that does not
+// exist yields ChownFailures that AllVanished recognises.
 func TestChownRMissingRootIsVanished(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "gone")
 
@@ -285,6 +287,8 @@ func TestChownRMissingRootIsVanished(t *testing.T) {
 	}
 }
 
+// TestAllVanishedRequiresEveryFailureToBeNotExist checks that AllVanished is
+// true only for a non-empty set of failures that are all ErrNotExist.
 func TestAllVanishedRequiresEveryFailureToBeNotExist(t *testing.T) {
 	notExist := ChownFailure{Path: "/gone", Err: &os.PathError{
 		Op: "lstat", Path: "/gone", Err: syscall.ENOENT,

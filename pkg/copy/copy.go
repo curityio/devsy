@@ -76,6 +76,9 @@ func (fs ChownFailures) AllVanished() bool {
 	return len(fs) > 0
 }
 
+// ChownR recursively changes the owner of path and everything under it to
+// userName, without following symlinks. It keeps going past per-entry errors
+// and returns them all as ChownFailures. An empty userName is a no-op.
 func ChownR(path string, userName string) error {
 	if userName == "" {
 		return nil

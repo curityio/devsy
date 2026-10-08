@@ -722,6 +722,9 @@ func buildEnvMarker(
 		strings.Join(unsetKeys, "\n")
 }
 
+// chownAgentSock hands the directory of SSH_AUTH_SOCK to the remote user so
+// they can reach the forwarded SSH agent. A directory that has vanished along
+// with its SSH connection is skipped rather than reported as an error.
 func chownAgentSock(setupInfo *config.Result) error {
 	user := config.GetRemoteUser(setupInfo)
 	agentSockFile := os.Getenv("SSH_AUTH_SOCK")
