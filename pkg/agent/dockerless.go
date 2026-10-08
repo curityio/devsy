@@ -77,17 +77,27 @@ func executeBuild(opts DockerlessBuildOptions) error {
 	}
 
 	cleanup := setupDockerCredentials(opts)
-	if cleanup != nil {
-		defer cleanup()
-	}
-
 	args := buildDockerlessArgs(binaryPath, opts)
+	buildErr := runDockerlessBuild(opts.Context, args, opts.Debug)
 
-	if err := runDockerlessBuild(opts.Context, args, opts.Debug); err != nil {
-		return err
+	return finishBuild(cleanup, buildErr, func() error {
+		return applyContainerEnv(opts.ImageConfigOutput)
+	})
+}
+
+// finishBuild runs the credentials cleanup and then, if the build succeeded,
+// applies the built image's environment. The cleanup restores the builder's
+// PATH and DOCKER_CONFIG, so it must run first: run after, it would overwrite
+// the image's PATH in this process, which setup keeps using.
+func finishBuild(cleanup func(), buildErr error, applyImageEnv func() error) error {
+	if cleanup != nil {
+		cleanup()
+	}
+	if buildErr != nil {
+		return buildErr
 	}
 
-	return applyContainerEnv(opts.ImageConfigOutput)
+	return applyImageEnv()
 }
 
 func validateBuildOptions(opts DockerlessBuildOptions) error {
