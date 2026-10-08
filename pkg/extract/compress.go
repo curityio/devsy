@@ -119,13 +119,7 @@ func (a *Archiver) tarFolder(target string, targetStat os.FileInfo) error {
 	}
 
 	if len(files) == 0 && target != "" {
-		hdr, _ := tar.FileInfoHeader(targetStat, filePath)
-		hdr.Mode = fillGo18FileTypeBits(int64(chmodTarEntry(os.FileMode(hdr.Mode))), targetStat)
-		hdr.Name = target
-		if err := a.writer.WriteHeader(hdr); err != nil {
-			return fmt.Errorf("tar write header: %w", err)
-		}
-		a.writtenFiles[target] = true
+		return a.tarEmptyFolder(target, targetStat)
 	}
 
 	for _, dirEntry := range files {
@@ -138,6 +132,19 @@ func (a *Archiver) tarFolder(target string, targetStat os.FileInfo) error {
 			return fmt.Errorf("recursive tar %s: %w", f.Name(), err)
 		}
 	}
+
+	return nil
+}
+
+func (a *Archiver) tarEmptyFolder(target string, targetStat os.FileInfo) error {
+	hdr, _ := tar.FileInfoHeader(targetStat, path.Join(a.basePath, target))
+	// #nosec G115 -- a tar header mode always fits in an os.FileMode
+	hdr.Mode = fillGo18FileTypeBits(int64(chmodTarEntry(os.FileMode(hdr.Mode))), targetStat)
+	hdr.Name = target
+	if err := a.writer.WriteHeader(hdr); err != nil {
+		return fmt.Errorf("tar write header: %w", err)
+	}
+	a.writtenFiles[target] = true
 
 	return nil
 }
