@@ -193,6 +193,28 @@ func TestStreamMount_InvalidIgnoreFileExcludesNothing(t *testing.T) {
 	}, entries)
 }
 
+// TestStreamMount_KeepsDockerlessBuildContext guards against #1108: the
+// dockerless build fails if the ignore file strips its build context.
+func TestStreamMount_KeepsDockerlessBuildContext(t *testing.T) {
+	setupInfo := newSetupInfo(t)
+	workspaceMount := config.GetWorkspaceMount(setupInfo)
+	writeFiles(t, workspaceMount.Source,
+		"run.sh",
+		config.DevsyContextFeatureFolder+"/Dockerfile-without-features",
+		config.DevsyContextFeatureFolder+"/feature/install.sh",
+	)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(workspaceMount.Source, pkgconfig.IgnoreFileName),
+		[]byte("**/*.sh\n"+config.DevsyContextFeatureFolder+"\n"), 0o600))
+	server := newSetupServer(setupInfo)
+
+	entries := streamMountEntries(t, server, workspaceMount)
+
+	assert.Contains(t, entries, config.DevsyContextFeatureFolder+"/Dockerfile-without-features")
+	assert.Contains(t, entries, config.DevsyContextFeatureFolder+"/feature/install.sh")
+	assert.NotContains(t, entries, "run.sh")
+}
+
 func TestStreamMount_UnknownMountIsRejected(t *testing.T) {
 	setupInfo := newSetupInfo(t)
 	server := newSetupServer(setupInfo)

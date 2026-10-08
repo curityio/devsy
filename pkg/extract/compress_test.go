@@ -20,6 +20,7 @@ const (
 	readmeFile  = "README.md"
 	emptyFolder = "empty"
 	worktrees   = ".claude/worktrees/"
+	nodeModules = "**/node_modules/"
 )
 
 // testTree is the set of files created in the archived folder by newTestTree.
@@ -120,7 +121,7 @@ var writeTarExcludeTests = []writeTarExcludeTest{
 	},
 	{
 		name:     "double star excludes a directory at any depth",
-		excludes: []string{"**/node_modules/"},
+		excludes: []string{nodeModules},
 		expected: without(allEntries(),
 			"node_modules/lib/index.js",
 			"web/node_modules/lib/index.js",
@@ -197,7 +198,7 @@ func TestWriteTarExcludeSingleFile(t *testing.T) {
 
 func TestArchiverMayReincludeBelow(t *testing.T) {
 	archiver, err := NewArchiver(t.TempDir(), nil, []string{
-		worktrees, "**/node_modules/", "!.claude/worktrees/feature/keep.txt",
+		worktrees, nodeModules, "!.claude/worktrees/feature/keep.txt",
 	})
 	require.NoError(t, err)
 
@@ -232,6 +233,33 @@ func TestPatternMayMatchBelow(t *testing.T) {
 				strings.Split(tt.pattern, "/"), strings.Split(tt.dir, "/")))
 		})
 	}
+}
+
+func TestWriteTarWithOptionsKeepsFoldersWhole(t *testing.T) {
+	root := newTestTree(t)
+
+	buf := &bytes.Buffer{}
+	require.NoError(t, WriteTarWithOptions(buf, root, TarOptions{
+		Excludes:  []string{nodeModules, "web/"},
+		KeepNames: []string{"node_modules"},
+	}))
+
+	entries := []string{}
+	reader := tar.NewReader(buf)
+	for {
+		hdr, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		entries = append(entries, hdr.Name)
+	}
+
+	// The kept folder is archived whole, but not inside a folder that is
+	// skipped before the walk reaches it
+	assert.Contains(t, entries, "node_modules/lib/index.js")
+	assert.NotContains(t, entries, "web/node_modules/lib/index.js")
+	assert.NotContains(t, entries, "web/app/node_modules/lib/index.js")
 }
 
 func TestWriteTarExcludeInvalidPattern(t *testing.T) {

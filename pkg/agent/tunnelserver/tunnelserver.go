@@ -510,7 +510,11 @@ func (t *tunnelServer) StreamWorkspace(
 	excludes := readIgnoreFile(t.workspace.Source.LocalFolder)
 
 	buf := bufio.NewWriterSize(NewStreamWriter(stream), 10*1024)
-	err := extract.WriteTarExclude(buf, t.workspace.Source.LocalFolder, false, excludes)
+	err := extract.WriteTarWithOptions(
+		buf,
+		t.workspace.Source.LocalFolder,
+		streamTarOptions(excludes),
+	)
 	if err != nil {
 		return err
 	}
@@ -554,7 +558,7 @@ func (t *tunnelServer) StreamMount(
 	}
 
 	buf := bufio.NewWriterSize(NewStreamWriter(stream), 10*1024)
-	err := extract.WriteTarExclude(buf, mount.Source, false, excludes)
+	err := extract.WriteTarWithOptions(buf, mount.Source, streamTarOptions(excludes))
 	if err != nil {
 		return err
 	}
@@ -706,6 +710,16 @@ func (t *tunnelServer) setResult(result *config.Result) {
 	t.resultMu.Lock()
 	defer t.resultMu.Unlock()
 	t.result = result
+}
+
+// streamTarOptions returns the options to stream a folder into the container
+// with excludes. The dockerless build context is always streamed whole, as the
+// build fails without it.
+func streamTarOptions(excludes []string) extract.TarOptions {
+	return extract.TarOptions{
+		Excludes:  excludes,
+		KeepNames: []string{config.DevsyContextFeatureFolder},
+	}
 }
 
 // readIgnoreFile returns the exclude patterns of the ignore file in folder, or

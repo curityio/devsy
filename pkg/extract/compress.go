@@ -17,12 +17,34 @@ import (
 	"github.com/moby/patternmatcher"
 )
 
+// TarOptions configures WriteTarWithOptions.
+type TarOptions struct {
+	// Compress gzips the archive.
+	Compress bool
+	// Excludes are patterns relative to the archived folder, with the same
+	// syntax as a .dockerignore file.
+	Excludes []string
+	// KeepNames are names of folders that are archived whole wherever the walk
+	// reaches them, whatever the excludes say.
+	KeepNames []string
+}
+
 func WriteTarExclude(
 	writer io.Writer,
 	localPath string,
 	compress bool,
 	excludedPaths []string,
 ) error {
+	return WriteTarWithOptions(
+		writer,
+		localPath,
+		TarOptions{Compress: compress, Excludes: excludedPaths},
+	)
+}
+
+// WriteTarWithOptions writes the file or the contents of the folder at
+// localPath as a tar archive to writer.
+func WriteTarWithOptions(writer io.Writer, localPath string, opts TarOptions) error {
 	absolute, err := filepath.Abs(localPath)
 	if err != nil {
 		return fmt.Errorf("absolute: %w", err)
@@ -34,7 +56,7 @@ func WriteTarExclude(
 	}
 
 	gw := writer
-	if compress {
+	if opts.Compress {
 		gwWriter := gzip.NewWriter(writer)
 		defer func() { _ = gwWriter.Close() }()
 
@@ -44,19 +66,17 @@ func WriteTarExclude(
 	tarWriter := tar.NewWriter(gw)
 	defer func() { _ = tarWriter.Close() }()
 
+	basePath, relativePath := absolute, ""
 	if !stat.IsDir() {
-		archiver, err := NewArchiver(filepath.Dir(absolute), tarWriter, excludedPaths)
-		if err != nil {
-			return err
-		}
-		return archiver.AddToArchive(filepath.Base(absolute))
+		basePath, relativePath = filepath.Dir(absolute), filepath.Base(absolute)
 	}
 
-	archiver, err := NewArchiver(absolute, tarWriter, excludedPaths)
+	archiver, err := NewArchiver(basePath, tarWriter, opts.Excludes)
 	if err != nil {
 		return err
 	}
-	return archiver.AddToArchive("")
+	archiver.keepNames = opts.KeepNames
+	return archiver.AddToArchive(relativePath)
 }
 
 func WriteTar(writer io.Writer, localPath string, compress bool) error {
@@ -74,6 +94,8 @@ type Archiver struct {
 	excludes *patternmatcher.PatternMatcher
 	// reincludes holds the components of each negation (!) pattern.
 	reincludes [][]string
+	// keepNames are names of folders archived whole, whatever the excludes say.
+	keepNames []string
 }
 
 // NewArchiver creates a new archiver. excludedPaths are patterns relative to
@@ -129,25 +151,53 @@ func (a *Archiver) addToArchive(relativePath string, parentInfo patternmatcher.M
 		return nil
 	}
 
+	if stat.IsDir() {
+		return a.addFolder(relativePath, stat, parentInfo)
+	}
+
+	excluded, _, err := a.isExcluded(relativePath, parentInfo)
+	if err != nil {
+		return err
+	}
+	if excluded {
+		return nil
+	}
+	return a.tarFile(relativePath, stat)
+}
+
+// addFolder adds a folder and what is in it to the archive.
+func (a *Archiver) addFolder(
+	relativePath string,
+	stat os.FileInfo,
+	parentInfo patternmatcher.MatchInfo,
+) error {
+	if a.isKept(relativePath) {
+		return a.tarFolderWhole(relativePath, stat)
+	}
+
 	excluded, info, err := a.isExcluded(relativePath, parentInfo)
 	if err != nil {
 		return err
 	}
 
-	if stat.IsDir() {
-		// Skip an excluded folder without reading it, unless a negation
-		// pattern could re-include something below it.
-		if excluded && !a.mayReincludeBelow(relativePath) {
-			return nil
-		}
-
-		return a.tarFolder(relativePath, stat, excluded, info)
-	}
-
-	if excluded {
+	// Skip an excluded folder without reading it, unless a negation
+	// pattern could re-include something below it.
+	if excluded && !a.mayReincludeBelow(relativePath) {
 		return nil
 	}
-	return a.tarFile(relativePath, stat)
+
+	return a.tarFolder(relativePath, stat, excluded, info)
+}
+
+// isKept reports whether the folder relativePath is archived whole.
+func (a *Archiver) isKept(relativePath string) bool {
+	return a.excludes != nil && slices.Contains(a.keepNames, path.Base(relativePath))
+}
+
+// tarFolderWhole archives a folder and everything in it, ignoring the excludes.
+func (a *Archiver) tarFolderWhole(relativePath string, stat os.FileInfo) error {
+	whole := &Archiver{basePath: a.basePath, writer: a.writer, writtenFiles: a.writtenFiles}
+	return whole.tarFolder(relativePath, stat, false, patternmatcher.MatchInfo{})
 }
 
 // mayReincludeBelow reports whether a negation pattern could match a path
